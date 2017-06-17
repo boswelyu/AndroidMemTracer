@@ -1,5 +1,5 @@
 # AndroidMemTracer
-One tool which can help you find out memory leaks on any dynamics library of your android application, without any change or re-complie on your application.
+One tool which can help find out memory leaks on any dynamics library of your android application, without any change or re-complie on your application.
 
 The initial purpose of this tool is help find out memory leaks from Games which made by Unity (enabled il2cpp feature). But it also can be used for cocos2d games, which has all the game logic in libcocos2dcpp.so, or any application used dynamic library.
 
