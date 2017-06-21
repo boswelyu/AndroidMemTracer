@@ -128,7 +128,7 @@ int parse_command_options(int argc, char * argv[])
 // 因为Android不支持IPC的进程间通信方式，这里把参数都写入固定的临时文件
 int pass_parameters(char * targetso, char * execpath, int maxlen)
 {
-	const char temp_file[MAX_PATH] = "/sdcard/tmp/memtracer_temp.swp";
+	const char temp_file[MAX_PATH] = "/sdcard/tmp/memtracer/param_pass.swp";
 	FILE * fp = fopen(temp_file, "w");
 	if(fp == NULL) 
 	{

@@ -64,7 +64,7 @@ int memtracer_init(int size)
         return -1;
     }
 
-    memtrace_file = fopen("/data/local/inject/memtrace.txt", "w");
+    memtrace_file = fopen("/sdcard/tmp/memtracer/check_result.txt", "w");
     if(memtrace_file == NULL) {
         LOGE("Create memtrace dump file failed, errno: %d, info: %s\n", errno, strerror(errno));
     }

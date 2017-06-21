@@ -49,7 +49,7 @@ int memtracer_entry(long * param)
 		return -1;
 	}
 
-	if(memtracer_init(5000) != 0)
+	if(memtracer_init(10000) != 0)
 	{
 		LOGE("MemTracer Init Failed!");
 		return -1;
@@ -83,7 +83,7 @@ int memtracer_entry(long * param)
  */
 int read_parameters() {
 	
-	const char temp_file[MAX_PATH_LEN] = "/sdcard/tmp/memtracer_temp.swp";
+	const char temp_file[MAX_PATH_LEN] = "/sdcard/tmp/memtracer/param_pass.swp";
 	FILE * fp = fopen(temp_file, "r");
 	if(fp == NULL)
 	{
