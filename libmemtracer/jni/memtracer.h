@@ -25,10 +25,10 @@ void trace_free(void * ptr, void (*orig_free)(void * addr));
 
 void memtracer_set_base(uint32_t addr);
 
-int start_memtrace();
+int start_memtrace(char * feedback, int maxlen);
 
-int stop_memtrace();
+int stop_memtrace(char * feedback, int maxlen);
 
-int dump_leaked_memory();
+int dump_leaked_memory(char * feedback, int maxlen);
 
 #endif

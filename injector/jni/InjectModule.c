@@ -10,19 +10,24 @@
 #include <sys/ptrace.h>    
 #include <sys/wait.h>    
 #include <sys/mman.h>  
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <arpa/inet.h>
 #include <dlfcn.h>    
 #include <dirent.h>    
 #include <unistd.h>    
 #include <string.h>    
-#include <elf.h>    
+#include <elf.h>
+#include <pthread.h> 
 #include <ptraceInject.h>
 #include <utils/logger.h>
 
 int parse_command_options(int argc, char * argv[]);
 int pass_parameters(char * targetso, char * modulefullpath, int maxlen);
-pid_t FindPidByProcessName(const char *process_name);
+int start_commander();
+void *feedback_listener(void * param);
 
-void PrintUsage(char * processName) {
+void print_usage(char * processName) {
 	printf("Usage: %s -p PID -t TargetSoName\n", processName);
 	printf("	Note: Need put one copy of your target so file under your memtracer execute path.\n");
 }
@@ -36,7 +41,7 @@ int main(int argc, char *argv[]) {
 
 	if(parse_command_options(argc, argv) != 0) 
 	{
-		PrintUsage(argv[0]);
+		print_usage(argv[0]);
 		return -1;
 	}
 
@@ -67,17 +72,19 @@ int main(int argc, char *argv[]) {
 	
 	printf("begin inject process, RemoteProcess pid:%d, InjectModuleName:%s, RemoteCallFunc:%s\n", pid, InjectModuleName, RemoteCallFunc);
 
-	iRet = inject_remote_process(pid,  InjectModuleName, RemoteCallFunc,  (long *)&socket_port, 1);
+	iRet = inject_remote_process(pid,  InjectModuleName, RemoteCallFunc, (long *)&socket_port, 1);
 	
 	if (iRet == 0)
 	{
 		printf("Inject Success\n");
+		start_commander();
 	}
 	else
 	{
 		printf("Inject Failed\n");
 	}
-	printf("end inject,%d\n", pid);
+
+
     return 0;  
 }  
 
@@ -151,6 +158,68 @@ int pass_parameters(char * targetso, char * execpath, int maxlen)
 	fclose(fp);
 
 	return 0;
+}
+
+// 打开socket给注入后的memtracer发送控制命令，并接收反馈
+int start_commander()
+{
+	int sock;
+    if ((sock = socket(PF_INET, SOCK_DGRAM, 0)) < 0)
+    {
+    	printf("Create commander socket failed.\n");
+    	return -1;
+    }
+
+    const char* SERVERIP = "127.0.0.1";
+        
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(socket_port);
+    servaddr.sin_addr.s_addr = inet_addr(SERVERIP);
+
+    // Start a thread to listening the command feedback
+    pthread_t recvthread;
+	pthread_create(&recvthread, NULL, feedback_listener, &sock);
+
+	printf("Memtracer commander started, available commands are: s[start], e[end], d[dump]\n");
+
+    int ret;
+    char sendbuf[256] = {0};
+    while (fgets(sendbuf, sizeof(sendbuf), stdin) != NULL)
+    {
+        sendto(sock, sendbuf, strlen(sendbuf), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
+        //ret = recvfrom(sock, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
+        //if (ret == -1)
+        //{
+        //    if (errno == EINTR)
+        //        continue;
+        //    ERR_EXIT("recvfrom");
+        //}
+        //printf("Received from server: %s\n",recvbuf);
+        memset(sendbuf, 0, sizeof(sendbuf));
+    }
+
+    close(sock);
+    return 0;
+}
+
+void * feedback_listener(void * param)
+{
+	int servsock = *((int *)param);
+	int ret;
+	char recvbuff[1024];
+	while(1)
+	{
+		memset(recvbuff, 0, sizeof(recvbuff));
+		ret = recvfrom(servsock, recvbuff, sizeof(recvbuff), 0, NULL, NULL);
+		if(ret >= 0) {
+			printf("%s\n", recvbuff);
+		}
+		else {
+			printf("Receive memtracer feedback failed!\n");
+		}
+	}
 }
 
 /*************************************************

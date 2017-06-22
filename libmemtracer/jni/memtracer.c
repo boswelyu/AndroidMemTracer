@@ -49,11 +49,12 @@ int     g_block_index = 0;
 int     g_traced_count = 0;
 
 // External Control flags
-int     g_trace_started = 0;
+int     g_trace_enabled = 0;
 int     g_trace_func_call = 1;
 
 uint32_t g_base_addr;
 
+char dump_file_name[128] = "/sdcard/tmp/memtracer/check_result.txt";
 FILE * memtrace_file = NULL;
 
 int memtracer_init(int size)
@@ -64,9 +65,9 @@ int memtracer_init(int size)
         return -1;
     }
 
-    memtrace_file = fopen("/sdcard/tmp/memtracer/check_result.txt", "w");
+    memtrace_file = fopen(dump_file_name, "w");
     if(memtrace_file == NULL) {
-        LOGE("Create memtrace dump file failed, errno: %d, info: %s\n", errno, strerror(errno));
+        LOGE("Create memtrace dump file %s failed, errno: %d, info: %s\n", dump_file_name, errno, strerror(errno));
     }
 
     memset(g_blocks_ptr, 0, sizeof(void *) * size);
@@ -79,6 +80,14 @@ int memtracer_init(int size)
     g_base_addr = 0;
 
     return 0;
+}
+
+// 重新开始内存跟踪，清理掉已经跟踪到的内存
+void reset_memtracer()
+{
+    memset(g_blocks_ptr, 0, sizeof(void *) * g_block_count);
+    g_block_index= 0;
+    g_traced_count = 0;
 }
 
 void memtracer_set_base(uint32_t addr)
@@ -110,7 +119,7 @@ int get_control_block()
 // 跟踪所有已经分配的内存
 void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
 {
-    if(g_trace_started == 0)
+    if(g_trace_enabled == 0)
     {
         // Record Not started Yet
         return orig_malloc(size);
@@ -176,39 +185,40 @@ void trace_free(void * ptr, void (*orig_free)(void * addr))
         MemControlBlock * ctrl_block = (MemControlBlock *)trace_addr;
         int block_index = ctrl_block->block_index;
         if(block_index >= 0 && block_index < g_block_count) {
-            if(g_blocks_ptr[block_index] != ptr) {
-                LOGE("ERROR: Address Traced in Control block not correct, %p:%p", ptr, g_blocks_ptr[block_index]);
+            if(g_blocks_ptr[block_index] == ptr) {
+                g_blocks_ptr[block_index] = NULL;
+                g_traced_count--;
             }
-            g_blocks_ptr[block_index] = NULL;
         }
         else {
             LOGE("ERROR: Invalid Control Block Index: %d", block_index);
         }
-        g_traced_count--;
+        
         orig_free((void *)trace_addr);
     }
 
 }
 
-int start_memtrace()
+int start_memtrace(char * feedback, int maxlen)
 {
-    g_trace_started = 1;
-    return g_trace_started;
+    reset_memtracer();
+    g_trace_enabled = 1;
+
+    return snprintf(feedback, maxlen, "Memory Trace Started");
 }
 
-int stop_memtrace()
+int stop_memtrace(char * feedback, int maxlen)
 {
-    g_trace_started = 0;
-    return g_trace_started;
+    g_trace_enabled = 0;
+    return snprintf(feedback, maxlen, "Memory Trace Ended");
 }
 
-int dump_leaked_memory()
+int dump_leaked_memory(char * feedback, int maxlen)
 {
     char formatbuffer[256];
     
     if(g_blocks_ptr == NULL || g_block_count == 0) {
-        LOGE(formatbuffer, "Memory Tracer Not Inited or inited with 0 size\n");
-        return -1;
+        return snprintf(feedback, maxlen, "Memory Tracer Not Inited or inited with 0 size");
     }
 
     int dumptofile = 1;
@@ -218,9 +228,7 @@ int dump_leaked_memory()
 
 
     if(g_traced_count == 0) {
-        sprintf(formatbuffer, "GOOD: No Memory Leak!\n");
-        dump_content(formatbuffer, dumptofile);
-        return 0;
+        return snprintf(feedback, maxlen, "Good! No Memory Leak!");
     }
 
     sprintf(formatbuffer, "==== %d blocks of memory leak detected ======\n", g_traced_count);
@@ -249,9 +257,11 @@ int dump_leaked_memory()
 
     if(dumptofile) {
         fflush(memtrace_file);
+
+        return snprintf(feedback, maxlen, ">> %d blocks of memory leak detected, details dumped to file %s", g_traced_count, dump_file_name);
     }
 
-    return 0;
+    return snprintf(feedback, maxlen, ">> %d blocks of memory leak detected, details dumped to logcat.", g_traced_count);
 }
 
 void dump_content(char * content, int dumptofile)

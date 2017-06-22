@@ -127,6 +127,7 @@ void * command_listener(void * params)
 	}
 
 	char recvbuff[128];
+	char sendbuff[1024];
 	struct sockaddr_in peeraddr;
 	socklen_t peerlen;
 	int n;
@@ -139,35 +140,25 @@ void * command_listener(void * params)
 		if(n > 0) {
 			recvbuff[n] = 0;
 			LOGI("Received Command: %s\n", recvbuff);
-			int ret = -1;
+			int retlen = 0;
 			switch(recvbuff[0])
 			{
 				case 's':
 					// Start Record Memory Malloc
-					ret = start_memtrace();
-					if(ret > 0) {
-						LOGI("Memory Trace Started!");
-					}
+					retlen = start_memtrace(sendbuff, sizeof(sendbuff));
 					break;
 				case 'e':
-					ret = stop_memtrace();
-					if(ret == 0) {
-						LOGI("Memory Trace Stoped!");
-					}
+					retlen = stop_memtrace(sendbuff, sizeof(sendbuff));
 					break;
 				case 'd':
-					ret = dump_leaked_memory();
-					if(ret == 0) {
-						LOGI("Memory Dumped Success!");
-					}
-					else {
-						LOGI("Dump Memory Failed!");
-					}
+					retlen = dump_leaked_memory(sendbuff, sizeof(sendbuff));
 					break;
 				default:
-					LOGE("Invalid Command: %c, supported command: s[start], e[end], d[dump]", recvbuff[0]);
+					retlen = sprintf(sendbuff, "Invalid Command: %c, supported command: s[start], e[end], d[dump]", recvbuff[0]);
 					break;
 			}
+
+			sendto(sockfd, sendbuff, retlen, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
 		}
 	}
 
