@@ -23,4 +23,5 @@ To find out where the leaked memory comes from, I made this tool. it will trace 
     
     
 Known Issues:
-    by 2017-6-29, current version of this tool only traced malloc and free, but not traced calloc and realloc, will work it out very soon.
+    1. Current version of this tool only traced malloc and free, but not traced calloc and realloc, will work it out very soon.
+    2. Each time the memtracer just started, the first command can not got the feedback from target process, still debuging
