@@ -182,7 +182,8 @@ int start_commander()
     pthread_t recvthread;
 	pthread_create(&recvthread, NULL, feedback_listener, &sock);
 
-	printf("Memtracer commander started, available commands are: s[start], e[end], d[dump]\n");
+	printf("Memtracer commander started, available commands are: \n"
+		"s[start], e[end], d[dump], c[simple mode switch], b[backtrace switch], r[reset]\n");
 
     int ret;
     char sendbuf[256] = {0};

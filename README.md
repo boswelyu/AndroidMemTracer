@@ -12,12 +12,15 @@ To find out where the leaked memory comes from, I made this tool. it will trace 
     Ihis tool uses ptrace inject technology to replace the malloc and free functions by a replaced one, in which we trace all the memory allocate and free action. One commander tool is used to control the time of start and stop collection of memory usage. 
     The general procedure of using this tool will be:
     1. start up the application you want to tested, and find out the PID of the application (by top or ps command);
-    2. Inject the memtracer library into your target process use 'inject' commander of this tool (e,g inject -p 10023 pt libtarget.so);
-    3. start up the commander, and press s to start memory collection;
+    2. Go to memtracer path, put one copy of your target dynamic library file to the root directory of memtracer (/data/local/memtracer) 
+    3. start up memtrace with target PID and target library name (./memtrace -p PID -t libxxxx.so)
+    4. According to the hint, press commands: s[start], e[end], d[dump], c[simple mode switch], b[backtrace switch], r[reset]
     4. run your test cases;
-    5. press e to end memory collection on commander
+    5. press e to end memory collection
     6. press d to dump the memory trace result;
     7. check your logcat to find out leaked memory blocks
     8. use addr2line or other tools to figure out where the leaked memory comes from on your code.
     
     
+Known Issues:
+    by 2017-6-29, current version of this tool only traced malloc and free, but not traced calloc and realloc, will work it out very soon.

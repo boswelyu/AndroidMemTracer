@@ -153,8 +153,18 @@ void * command_listener(void * params)
 				case 'd':
 					retlen = dump_leaked_memory(sendbuff, sizeof(sendbuff));
 					break;
+				case 'c':
+					retlen = switch_simple_mode(sendbuff, sizeof(sendbuff));
+					break;
+				case 'b':
+					retlen = switch_backtrace_mode(sendbuff, sizeof(sendbuff));
+					break;
+				case 'r':
+					retlen = reset_memtracer(sendbuff, sizeof(sendbuff));
+					break;
 				default:
-					retlen = sprintf(sendbuff, "Invalid Command: %c, supported command: s[start], e[end], d[dump]", recvbuff[0]);
+					retlen = sprintf(sendbuff, "Invalid Command: %c, supported commands are:\n"
+						" s[start], e[end], d[dump], c[simple mode switch], b[backtrace switch], r[reset]\n", recvbuff[0]);
 					break;
 			}
 
@@ -416,7 +426,7 @@ int do_got_hook(const char *TargetDir, const char *TargetSoName,
 	LOGI("[+] uiGotTableSize is %08x\n",uiGotTableSize);
 
 	uint32_t base = get_module_base(-1, TargetSoName);
-	memtracer_set_base(base);
+	interpret_mmaps();
 
 	int bHaveFoundTargetAddr = 0, i;
 	for(i = 0; i < uiGotTableSize; i = i + 4)

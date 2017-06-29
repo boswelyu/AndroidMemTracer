@@ -4,9 +4,13 @@
 #include <errno.h>
 #include <utils/logger.h>
 #include <memtracer.h>
+#include <strings.h>
 
 // Forward declare of internal function
 void dump_content(char * content, int dumptofile);
+void add_map_element(unsigned int startaddr, unsigned int endaddr, char * libname);
+void dump_backtrace(unsigned int addr, char * buffer, int maxlen);
+char * find_last(char * str, char ch);
 
 // ========== 记录函数调用序列 ==========
 typedef struct backtraceState
@@ -14,6 +18,13 @@ typedef struct backtraceState
     void** current;
     void** end;
 }BacktraceState;
+
+typedef struct mmap_element
+{
+    unsigned int startAddr;
+    unsigned int endAddr;
+    char libName[128];
+}MMapDataCell;
 
 static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context* context, void* arg)
 {
@@ -32,9 +43,8 @@ static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context* context, void
 
 size_t capture_backtrace(void** buffer)
 {
-    BacktraceState state = {buffer, buffer + MAX_DEPTH};
+    BacktraceState state = {buffer, buffer + MAX_DEPTH - 1};
     _Unwind_Backtrace(unwind_callback, &state);
-
     size_t depth = state.current - buffer;
 
     return depth;
@@ -50,15 +60,24 @@ int     g_traced_count = 0;
 
 // External Control flags
 int     g_trace_enabled = 0;
+// 简易模式：只记录数值，不记录BT
+int     g_simple_mode = 0;
 int     g_trace_func_call = 1;
 
-uint32_t g_base_addr;
+// 存储链接库地址范围
+MMapDataCell * g_mmaps_data;
+int     g_mmaps_cap = 128;
+int     g_mmaps_count = 0;
+
 
 char dump_file_name[128] = "/sdcard/tmp/memtracer/check_result.txt";
 FILE * memtrace_file = NULL;
 
+void * (*original_malloc)(size_t size);
+
 int memtracer_init(int size)
 {
+    original_malloc = malloc;
     g_blocks_ptr = (void* *)malloc(sizeof(void *) * size);
     if(g_blocks_ptr == NULL) {
         LOGE("Allocate Memory For CtrlBlockState array Failed!");
@@ -77,22 +96,59 @@ int memtracer_init(int size)
 
     g_traced_count = 0;
 
-    g_base_addr = 0;
+    g_mmaps_data = (MMapDataCell *)malloc(sizeof(MMapDataCell) * g_mmaps_cap);
+    memset(g_mmaps_data, 0, sizeof(MMapDataCell) * g_mmaps_cap);
+    g_mmaps_count = 0;
 
     return 0;
 }
 
 // 重新开始内存跟踪，清理掉已经跟踪到的内存
-void reset_memtracer()
+int reset_memtracer(char * feedback, int maxlen)
 {
     memset(g_blocks_ptr, 0, sizeof(void *) * g_block_count);
     g_block_index= 0;
     g_traced_count = 0;
+    return snprintf(feedback, maxlen, "Memtracer Reset Done");
 }
 
-void memtracer_set_base(uint32_t addr)
+// 遍历mmaps，解析并存储每一个动态链接库的地址映射范围和名字，同一个名字可能会存储多次
+void interpret_mmaps()
 {
-    g_base_addr = addr;
+    char line[1024];
+    char buff[128];
+    FILE * fp = fopen("/proc/self/maps", "r");
+
+    extern void post_process_str(char * strbuf, int maxlen);
+
+    if (fp != NULL) 
+    {
+        while (fgets(line, sizeof(line), fp)) 
+        {
+            if (strstr(line, ".so"))
+            {
+                char * fmins = index(line, '-');
+                strncpy(buff, line, fmins - line);
+                buff[fmins - line] = 0;
+                unsigned int startaddr = strtoul(buff, NULL, 16);
+
+                char * fspace = index(line, ' ');
+                strncpy(buff, fmins + 1, fspace - fmins - 1);
+                buff[fspace - fmins - 1] = 0;
+                unsigned int endaddr = strtoul(buff, NULL, 16);
+
+                char * libname = find_last(line, ' ');
+                if(libname != NULL) {
+                    post_process_str(libname, strlen(libname));
+                    add_map_element(startaddr, endaddr, libname);
+                }
+                else {
+                    LOGE("Parse lib name failed: %s", line);
+                }
+            }
+        }
+        fclose(fp);
+    }
 }
 
 int get_control_block()
@@ -125,6 +181,12 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
         return orig_malloc(size);
     }
 
+    if(g_simple_mode == 1) {
+        // 简易模式，只记录数值，不增加跟踪控制块
+        g_traced_count++;
+        return orig_malloc(size);
+    }
+
     void * buffer[MAX_DEPTH];
     int bt_depth = 0;
     if(g_trace_func_call != 0) {
@@ -145,7 +207,8 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
     MemControlBlock * ctrlBlock = (MemControlBlock *)addr;
     ctrlBlock->block_index = free_block_index;
     ctrlBlock->size = size;
-    ctrlBlock->fix_magic_num = MAGIC_NUM;
+    ctrlBlock->magic_num1 = MAGIC_NUM;
+    ctrlBlock->magic_num2 = MAGIC_NUM;
 
     // 填充ControlBlock的信息
     if(g_trace_func_call != 0) {
@@ -174,8 +237,12 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
 void trace_free(void * ptr, void (*orig_free)(void * addr))
 {
     // TODO: Check if address is valid
-	if(*(unsigned int *)((char *)ptr - sizeof(unsigned int)) != MAGIC_NUM) 
+	if(*(unsigned int *)((char *)ptr - sizeof(unsigned int)) != MAGIC_NUM ||
+        *(unsigned int *)((char *)ptr - 2 * sizeof(unsigned int)) != MAGIC_NUM ) 
     {
+        if(g_simple_mode == 1) {
+            g_traced_count--;
+        }
         // LOGI("Not Traced Memory, Use Original Free");
         orig_free(ptr);
     }
@@ -201,9 +268,7 @@ void trace_free(void * ptr, void (*orig_free)(void * addr))
 
 int start_memtrace(char * feedback, int maxlen)
 {
-    reset_memtracer();
     g_trace_enabled = 1;
-
     return snprintf(feedback, maxlen, "Memory Trace Started");
 }
 
@@ -211,6 +276,30 @@ int stop_memtrace(char * feedback, int maxlen)
 {
     g_trace_enabled = 0;
     return snprintf(feedback, maxlen, "Memory Trace Ended");
+}
+
+int switch_simple_mode(char * feedback, int maxlen)
+{
+    if(g_simple_mode == 0) {
+        g_simple_mode = 1;
+        return snprintf(feedback, maxlen, "Simple Mode Enabled");
+    }
+    else {
+        g_simple_mode = 0;
+        return snprintf(feedback, maxlen, "Simple Mode Disabled");
+    }
+}
+
+int switch_backtrace_mode(char * feedback, int maxlen)
+{
+    if(g_trace_func_call == 1) {
+        g_trace_func_call = 0;
+        return snprintf(feedback, maxlen, "Backtrace will NOT be recorded");
+    }
+    else {
+        g_trace_func_call = 1;
+        return snprintf(feedback, maxlen, "Backtrace Record Enabled");
+    }
 }
 
 int dump_leaked_memory(char * feedback, int maxlen)
@@ -231,6 +320,10 @@ int dump_leaked_memory(char * feedback, int maxlen)
         return snprintf(feedback, maxlen, "Good! No Memory Leak!");
     }
 
+    if(g_simple_mode == 1) {
+        return snprintf(feedback, maxlen, "Simple Mode Enabled, %d blocks of memory leak recorded\n", g_traced_count);
+    }
+
     sprintf(formatbuffer, "==== %d blocks of memory leak detected ======\n", g_traced_count);
     dump_content(formatbuffer, dumptofile);
     int i, j, counter = 0;
@@ -246,8 +339,9 @@ int dump_leaked_memory(char * feedback, int maxlen)
 
             for(j = 0; j < ctrlBlock->bt_depth; j++)
             {
-                sprintf(formatbuffer, "          %p\n", ctrlBlock->backtrace[j] - g_base_addr);
+                dump_backtrace((unsigned int)ctrlBlock->backtrace[j], formatbuffer, sizeof(formatbuffer));
                 dump_content(formatbuffer, dumptofile);
+                
             }
             counter++;
         }
@@ -272,4 +366,74 @@ void dump_content(char * content, int dumptofile)
     else {
         LOGI("%s", content);
     }
+}
+
+void add_map_element(unsigned int startaddr, unsigned int endaddr, char * libname)
+{
+    int i = 0;
+    for(i = 0; i < g_mmaps_count; i++)
+    {
+        MMapDataCell * cellptr = g_mmaps_data + i;
+        if(strcmp(cellptr->libName, libname) == 0) {
+            if(startaddr < cellptr->startAddr) {
+                cellptr->startAddr = startaddr;
+            }
+            if(endaddr > cellptr->endAddr) {
+                cellptr->endAddr = endaddr;
+            }
+            return;
+        }
+    }
+
+    if(g_mmaps_count >= g_mmaps_cap) 
+    {
+        // Increase the cap of mmaps
+        MMapDataCell * newptr = (MMapDataCell *)original_malloc(sizeof(MMapDataCell) * (g_mmaps_cap + 128));
+        if(newptr == NULL)
+        {
+            LOGE("Allocate memory to increase MMapCell size failed\n");
+            return;
+        }
+
+        memcpy(newptr, g_mmaps_data, sizeof(MMapDataCell) * g_mmaps_count);
+        free(g_mmaps_data);
+        g_mmaps_data = newptr;
+        g_mmaps_cap += 128;
+    }
+
+    MMapDataCell * cellptr = g_mmaps_data + g_mmaps_count;
+    cellptr->startAddr = startaddr;
+    cellptr->endAddr = endaddr;
+    strncpy(cellptr->libName, libname, 128);
+    g_mmaps_count++;
+}
+
+// Check which library the given address comes from
+void dump_backtrace(unsigned int addr, char * buffer, int maxlen)
+{
+    int i = 0;
+    for(i = 0; i < g_mmaps_count; i++) {
+        MMapDataCell * cellptr = g_mmaps_data + i;
+
+        if(addr >= cellptr->startAddr && addr <= cellptr->endAddr)
+        {
+            snprintf(buffer, maxlen, "        %p   %s\n", (void *)(addr - cellptr->startAddr), cellptr->libName);
+            return;
+        }
+    }
+
+    snprintf(buffer, maxlen, "      %p  Unknown\n", (void *)addr);
+}
+
+char * find_last(char * str, char ch)
+{
+    int len = strlen(str);
+    int index;
+    for(index = len - 1; index >= 0; index--)
+    {
+        if(str[index] == ch) {
+            return &str[index + 1];
+        }
+    }
+    return NULL;
 }
