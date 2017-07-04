@@ -20,6 +20,10 @@ int memtracer_init(int size);
 // 使用传入的分配函数分配内存，并跟踪
 void * trace_malloc(size_t size, void*(*orig_malloc)(size_t s));
 
+void * trace_calloc(size_t blocks, size_t size, void * (*orig_calloc)(size_t blocks, size_t size), void * (*orig_malloc)(size_t len));
+
+void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, size_t size), void * (*orig_malloc)(size_t len));
+
 // 使用传入的释放函数释放内存
 void trace_free(void * ptr, void (*orig_free)(void * addr));
 

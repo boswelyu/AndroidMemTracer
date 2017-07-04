@@ -172,6 +172,25 @@ int get_control_block()
     return -1;
 }
 
+void * trace_calloc(size_t blocks, size_t size, void * (*orig_calloc)(size_t blocks, size_t size), void * (orig_malloc)(size_t len))
+{
+    if(g_trace_enabled == 0)
+    {
+        return orig_calloc(blocks, size);
+    }
+
+    if(g_simple_mode == 1)
+    {
+        g_traced_count++;
+        return orig_calloc(blocks, size);
+    }
+
+    void * ptr = trace_malloc(blocks * size, orig_malloc);
+    memset(ptr, 0, blocks * size);
+
+    return ptr;
+}
+
 // 跟踪所有已经分配的内存
 void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
 {
@@ -231,6 +250,14 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
     //LOGI("Memory Traced, Return Address: %p, Actual Malloced: %p", retaddr, addr);
 
     return (void *)retaddr;
+}
+
+
+
+void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, size_t size), void * (*orig_malloc)(size_t len))
+{
+    // TODO
+    return orig_realloc(ptr, size);
 }
 
 // 记录已经释放的内存

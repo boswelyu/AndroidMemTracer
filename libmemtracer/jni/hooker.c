@@ -18,24 +18,46 @@ int read_parameters();
 void post_process_str(char * strbuf, int maxlen);
 void * command_listener(void * param);
 
-int do_got_hook(const char *TargetDir, const char *TargetSoName,
-			 void *symbol, void *new_function, void **old_function);
+int parse_target_library(const char *targetdir, const char *targetsoname);
+
+int do_got_hook(void *symbol, void *new_function, void **old_function);
 
 
 char g_target_so[MAX_PATH_LEN];
 char g_main_dir[MAX_PATH_LEN];
 int  g_socket_port = 7788;
+uint32_t g_GotTableStartaddr = 0;
+uint32_t g_GotTableSize = 0;
+uint32_t g_base = 0;
 
 void * (*orig_malloc)(size_t size);
-void * replaced_malloc(size_t size) {
+void * replaced_malloc(size_t size) 
+{
 	void * ptr = trace_malloc(size, orig_malloc);
 	return ptr;
 } 
 
+void * (*orig_calloc)(size_t blocks, size_t size);
+void * replaced_calloc(size_t blocks, size_t size) 
+{
+	void * ptr = trace_calloc(blocks, size, orig_calloc, orig_malloc);
+	return ptr;
+}
+
+void * (*orig_realloc)(void *ptr, size_t size);
+void * replaced_realloc(void *addr, size_t size)
+{
+	void * retptr = trace_realloc(addr, size, orig_realloc, orig_malloc);
+	return retptr;
+}
+
 void (*orig_free)(void * ptr);
-void replaced_free(void * ptr) {
+void replaced_free(void * ptr) 
+{
 	trace_free(ptr, orig_free);
 }
+
+
 
 /* libmemtracer.so注入目标进程后执行的入口函数 */
 int memtracer_entry(long * param)
@@ -49,7 +71,7 @@ int memtracer_entry(long * param)
 		return -1;
 	}
 
-	if(memtracer_init(10000) != 0)
+	if(memtracer_init(20000) != 0)
 	{
 		LOGE("MemTracer Init Failed!");
 		return -1;
@@ -60,18 +82,41 @@ int memtracer_entry(long * param)
 	pthread_create(&ptd, NULL, command_listener, NULL);
 	
 	int iret;
-	iret = do_got_hook(g_main_dir, g_target_so, (void *)malloc, (void *)replaced_malloc, (void **)&orig_malloc);
+	iret = parse_target_library(g_main_dir, g_target_so);
+	if(iret != 0)
+	{
+		LOGE("Parse Library File Failed!");
+		return -1;
+	}
+
+	iret = do_got_hook((void *)calloc, (void *)replaced_calloc, (void **)&orig_calloc);
+	if(iret != 0)
+	{
+		LOGE("MemTracer hook function calloc failed!");
+		return -1;
+	}
+
+	iret = do_got_hook((void *)malloc, (void *)replaced_malloc, (void **)&orig_malloc);
 	if(iret != 0) {
 		LOGE("MemTracer hook function malloc failed!");
 		return -1;
 	}
 
-	iret = do_got_hook(g_main_dir, g_target_so, (void *)free, (void *)replaced_free, (void **)&orig_free);
+	iret = do_got_hook((void *)realloc, (void *)replaced_realloc, (void **)&orig_realloc);
+	if(iret != 0)
+	{
+		LOGE("MemTracer hook function realloc failed!");
+		return -1;
+	}
+
+	iret = do_got_hook((void *)free, (void *)replaced_free, (void **)&orig_free);
 	if(iret != 0)
 	{
 		LOGE("MemTracer hook function free failed!");
 		return -1;
 	}
+
+
 
 	return 0;
 }
@@ -366,35 +411,9 @@ int GetGotStartAddrAndSize(FILE *fp, uint32_t *GotTableStartaddr, uint32_t *GotT
 	return 0;
 }
 
-
-/**
- * @description GotHook接口
- * @param IN 目标目录
- * @param IN 模块名字
- * @param IN 要Hook的symbol地址
- * @param IN 新函数地址
- * @param OUT 旧函数存放的地址
- * @return 失败返回 -1
- */
-int do_got_hook(const char *TargetDir, const char *TargetSoName,
-			 void *symbol, void *new_function, void **old_function)
+//解析要寻找GOT位置的so文件
+int parse_target_library(const char *TargetDir, const char *TargetSoName)
 {
-	uint32_t uiGotTableStartaddr = 0;
-	uint32_t uiGotTableSize = 0;
-	//打开要寻找GOT位置的so
-
-	if(NULL == symbol)
-	{
-		LOGE("[-] symbol is NUll.");
-		return -1;
-	}
-
-	if(NULL == new_function)
-	{
-		LOGE("[-] new_function is NUll.");
-		return -1;
-	}
-
 	if(NULL == TargetDir)
 	{
 		LOGE("[-] TargetDir is NUll.");
@@ -410,39 +429,65 @@ int do_got_hook(const char *TargetDir, const char *TargetSoName,
 	char filepath[256] = {0};
 	snprintf(filepath, sizeof(filepath), "%s/%s", TargetDir, TargetSoName);
 
-	FILE *file = fopen(filepath, "rb");
+	FILE * file = fopen(filepath, "rb");
 	if(NULL == file)
 	{
 		LOGE("[-] do_got_hook open file fail: %s, error: %s", filepath, strerror(errno));
 		return -1;
 	}
-	int nRet = GetGotStartAddrAndSize(file, &uiGotTableStartaddr, &uiGotTableSize);
+	int nRet = GetGotStartAddrAndSize(file, &g_GotTableStartaddr, &g_GotTableSize);
 	if(-1 == nRet)
 	{
 		LOGE("[-] GetGotStartAddrAndSize fail.");
 		return -1;
 	}
-	LOGI("[+] uiGotTableStartaddr is %08x\n",uiGotTableStartaddr);
-	LOGI("[+] uiGotTableSize is %08x\n",uiGotTableSize);
+	LOGI("[+] uiGotTableStartaddr is %08x\n",g_GotTableStartaddr);
+	LOGI("[+] uiGotTableSize is %08x\n",g_GotTableSize);
 
-	uint32_t base = get_module_base(-1, TargetSoName);
+	g_base = get_module_base(-1, TargetSoName);
 	interpret_mmaps();
 
-	int bHaveFoundTargetAddr = 0, i;
-	for(i = 0; i < uiGotTableSize; i = i + 4)
-	{
-		if(*(uint32_t *)(base + uiGotTableStartaddr + i) == (uint32_t)symbol)
-		{
+	fclose(file);
+	return 0;
+}
 
+/**
+ * @description GotHook接口
+ * @param IN 目标目录
+ * @param IN 模块名字
+ * @param IN 要Hook的symbol地址
+ * @param IN 新函数地址
+ * @param OUT 旧函数存放的地址
+ * @return 失败返回 -1
+ */
+int do_got_hook(void *symbol, void *new_function, void **old_function)
+{
+	if(symbol == NULL) 
+	{
+		LOGE("do_got_hook symbol is NULL");
+		return -1;
+	}
+
+	if(new_function == NULL)
+	{
+		LOGE("do_got_hook new_function is NULL");
+		return -1;
+	}
+
+	int bHaveFoundTargetAddr = 0, i;
+	for(i = 0; i < g_GotTableSize; i = i + 4)
+	{
+		if(*(uint32_t *)(g_base + g_GotTableStartaddr + i) == (uint32_t)symbol)
+		{
 			//保存旧值赋新值
 			*old_function = symbol;
 
 			LOGI("[+] the addr of old_function is: %p",symbol);
 			LOGI("[+] the addr of new_function is: %p",new_function);
 			//修改地址写权限，往地址写值
-			write_data_to_addr(base + uiGotTableStartaddr + i, (uint32_t)new_function);
+			write_data_to_addr(g_base + g_GotTableStartaddr + i, (uint32_t)new_function);
 			LOGI("[+] modify done. it is point to addr : %08x",
-				 *(uint32_t *)(base + uiGotTableStartaddr + i));
+				 *(uint32_t *)(g_base + g_GotTableStartaddr + i));
 
 			bHaveFoundTargetAddr = 1;
 			break;
@@ -454,9 +499,9 @@ int do_got_hook(const char *TargetDir, const char *TargetSoName,
 	}
 	else
 	{
-		LOGE("[-] do_got_hook fail");
+		LOGE("[-] do_got_hook fail, could not find symbol in got");
 	}	
-	fclose(file);
+
 	return 0;
 }
 
