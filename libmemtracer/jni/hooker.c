@@ -44,19 +44,18 @@ void * replaced_calloc(size_t blocks, size_t size)
 	return ptr;
 }
 
-void * (*orig_realloc)(void *ptr, size_t size);
-void * replaced_realloc(void *addr, size_t size)
-{
-	void * retptr = trace_realloc(addr, size, orig_realloc, orig_malloc);
-	return retptr;
-}
-
 void (*orig_free)(void * ptr);
 void replaced_free(void * ptr) 
 {
 	trace_free(ptr, orig_free);
 }
 
+void * (*orig_realloc)(void *ptr, size_t size);
+void * replaced_realloc(void *addr, size_t size)
+{
+	void * retptr = trace_realloc(addr, size, orig_realloc, orig_malloc, orig_free);
+	return retptr;
+}
 
 
 /* libmemtracer.so注入目标进程后执行的入口函数 */

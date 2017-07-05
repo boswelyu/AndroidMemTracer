@@ -224,10 +224,12 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
 
     // 填充COntrolBlock信息
     MemControlBlock * ctrlBlock = (MemControlBlock *)addr;
+    ctrlBlock->preholder = 0;
     ctrlBlock->block_index = free_block_index;
     ctrlBlock->size = size;
     ctrlBlock->magic_num1 = MAGIC_NUM;
     ctrlBlock->magic_num2 = MAGIC_NUM;
+    ctrlBlock->postholder = 0;
 
     // 填充ControlBlock的信息
     if(g_trace_func_call != 0) {
@@ -254,29 +256,104 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
 
 
 
-void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, size_t size), void * (*orig_malloc)(size_t len))
+void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, size_t size), 
+    void *(*orig_malloc)(size_t len), void (*orig_free)(void * addr))
 {
-    // TODO
-    return orig_realloc(ptr, size);
+    if(ptr == NULL)
+    {
+        return trace_malloc(size, orig_malloc);
+    }
+
+    if(size == 0)
+    {
+        trace_free(ptr, orig_free);
+        return NULL;
+    }
+
+    LOGI("Realloc on addr: %p, new size: %d", ptr, size);
+
+    if(*(unsigned int *)((char *)ptr - 3 * sizeof(unsigned int)) != MAGIC_NUM ||
+        *(unsigned int *)((char *)ptr - 4 * sizeof(unsigned int)) != MAGIC_NUM)
+    {
+        // Not trace malloc or calloc allocated memory
+        return orig_realloc(ptr, size);
+    }
+    
+    void * realaddr = (void *)((char *)ptr - sizeof(MemControlBlock));
+
+    void * newaddr = orig_realloc(realaddr, size + sizeof(MemControlBlock));
+
+    if(newaddr == NULL)
+    {
+        LOGE("Reallocate Failed With size: %d + %d", size, sizeof(MemControlBlock));
+    }
+    else
+    {
+        MemControlBlock * ctrl_block = (MemControlBlock *)newaddr;
+        ctrl_block->size = size;
+
+        if(newaddr != realaddr)
+        {
+            int block_index = ctrl_block->block_index;
+
+            if(block_index >= 0 && block_index < g_block_count)
+            {
+                if(g_blocks_ptr[block_index] == realaddr)
+                {
+                    g_blocks_ptr[block_index] = newaddr;
+                    LOGI("New Reallocated address: %p", newaddr);
+                }
+                else
+                {
+                    LOGE("Address error in realloc, block index: %d, recoreded address: %p, real address: %p",
+                        block_index, g_blocks_ptr[block_index], realaddr);
+                }
+            }
+            else 
+            {
+                LOGE("Invalid block index in realloc: %d", block_index);
+            }
+        }
+    }
+    void * retaddr = (void *)((char *)newaddr + sizeof(MemControlBlock));
+    return retaddr;
+}
+
+int is_valid_address(void * addr)
+{
+    if((unsigned int)addr >= 0x10000000)
+    {
+        return 1;
+    }
+    return 0;
 }
 
 // 记录已经释放的内存
 void trace_free(void * ptr, void (*orig_free)(void * addr))
 {
     // TODO: Check if address is valid
-	if(*(unsigned int *)((char *)ptr - sizeof(unsigned int)) != MAGIC_NUM ||
-        *(unsigned int *)((char *)ptr - 2 * sizeof(unsigned int)) != MAGIC_NUM ) 
+	if(*(unsigned int *)((char *)ptr - 3* sizeof(unsigned int)) != MAGIC_NUM ||
+        *(unsigned int *)((char *)ptr - 4 * sizeof(unsigned int)) != MAGIC_NUM ) 
     {
         if(g_simple_mode == 1) {
             g_traced_count--;
         }
-        // LOGI("Not Traced Memory, Use Original Free");
+        LOGI("Not Traced Memory, Use Original Free: %p", ptr);
+
         orig_free(ptr);
     }
     else
     {
         char * trace_addr = (char *)ptr - sizeof(MemControlBlock);
         MemControlBlock * ctrl_block = (MemControlBlock *)trace_addr;
+
+        if(ctrl_block->preholder != 0) {
+            LOGE("+++++++++++++ Memory overflow detected +++++++++++");
+        }
+        if(ctrl_block->postholder != 0) {
+            LOGE("+++++++++++++ This block of memory has overflow +++++++++++");
+        }
+
         int block_index = ctrl_block->block_index;
         if(block_index >= 0 && block_index < g_block_count) {
             if(g_blocks_ptr[block_index] == ptr) {
@@ -288,7 +365,9 @@ void trace_free(void * ptr, void (*orig_free)(void * addr))
             LOGE("ERROR: Invalid Control Block Index: %d", block_index);
         }
         
-        orig_free((void *)trace_addr);
+        if(is_valid_address((void *)trace_addr)) {
+            orig_free((void *)trace_addr);
+        }
     }
 
 }
@@ -361,8 +440,19 @@ int dump_leaked_memory(char * feedback, int maxlen)
             MemControlBlock * ctrlBlock = (MemControlBlock *)((char *)g_blocks_ptr[i] - sizeof(MemControlBlock));
             sprintf(formatbuffer, "    Memory Leaked at:%p, leaked size:%d, bt depth: %d\n", 
                 g_blocks_ptr[i], ctrlBlock->size, ctrlBlock->bt_depth);
-
             dump_content(formatbuffer, dumptofile);
+
+            if(ctrlBlock->postholder != 0)
+            {
+                sprintf(formatbuffer, "************** Memory Underflowed **************");
+                dump_content(formatbuffer, dumptofile);
+            }
+
+            if(ctrlBlock->preholder != 0)
+            {
+                sprintf(formatbuffer, "************** Detected other Memory Overflow **************");
+                dump_content(formatbuffer, dumptofile);
+            }
 
             for(j = 0; j < ctrlBlock->bt_depth; j++)
             {

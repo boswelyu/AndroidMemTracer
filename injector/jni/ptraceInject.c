@@ -16,6 +16,7 @@
 #include <unistd.h>    
 #include <string.h>    
 #include <elf.h>    
+#include <errno.h>
 #include <utils/logger.h> 
 #include <ptraceInject.h>
 
@@ -37,7 +38,7 @@ int ptrace_continue(pid_t pid)
 {
 	if (ptrace(PTRACE_CONT, pid, NULL, NULL) < 0)
 	{
-		LOGD("ptrace cont error, pid:%d", pid);
+		LOGD("ptrace continue error, pid:%d, error: %s", pid, strerror(errno));
 		return -1;
 	}
 	return 0;
@@ -55,7 +56,7 @@ int ptrace_attach(pid_t pid)
 	int status = 0;
 	
     if (ptrace(PTRACE_ATTACH, pid, NULL, 0) < 0) {    
-        LOGD("attach process error, pid:%d", pid);    
+        LOGD("attach process error, pid:%d, error: %s", pid, strerror(errno));    
         return -1;    
     }    
 	
@@ -75,7 +76,7 @@ int ptrace_attach(pid_t pid)
 int ptrace_detach(pid_t pid)    
 {    
     if (ptrace(PTRACE_DETACH, pid, NULL, 0) < 0) {    
-        LOGD("detach process error, pid:%d", pid);     
+        LOGD("detach process error, pid:%d, error: %s", pid, strerror(errno));     
         return -1;    
     }    
     
