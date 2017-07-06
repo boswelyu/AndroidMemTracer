@@ -4,6 +4,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -13,6 +15,9 @@
 #include <memtracer.h>
 
 #define MAX_PATH_LEN 256
+
+const char pass_fifo[] = "/data/data/memtracer_pass.fifo";
+const char tick_fifo[] = "/data/data/memtracer_tick.fifo";
 
 int read_parameters();
 void post_process_str(char * strbuf, int maxlen);
@@ -125,24 +130,70 @@ int memtracer_entry(long * param)
  * 1 - 执行hook的目标库文件名
  * 2 - 母程序的执行路径
  */
-int read_parameters() {
-	
-	const char temp_file[MAX_PATH_LEN] = "/sdcard/tmp/memtracer/param_pass.swp";
-	FILE * fp = fopen(temp_file, "r");
-	if(fp == NULL)
-	{
-		LOGE("Open %s to read parametes failed, error: %s\n", temp_file, strerror(errno));
+int read_parameters() 
+{	
+	// 打开只读管道读取运行参数
+	int pass_fd = open(pass_fifo, O_RDONLY);
+	if(pass_fd < 0) {
+		LOGE("Open Pass FIFO Failed: %s\n", strerror(errno));
 		return -1;
 	}
 
-	fgets(g_target_so, sizeof(g_target_so), fp);
-	post_process_str(g_target_so, sizeof(g_target_so));
-	fgets(g_main_dir, sizeof(g_main_dir), fp);
-	post_process_str(g_main_dir, sizeof(g_main_dir));
+	char buffer[1024];
+	int readbytes = read(pass_fd, buffer, sizeof(buffer));
+	if(readbytes == -1)
+	{
+		LOGE("Read data failed: %s", strerror(errno));
+		return -1;
+	}
+
+	if(parse_parameters(buffer, readbytes) == -1)
+	{
+		LOGE("Parse Parameters from server failed");
+		return -1;
+	}
 
 	LOGI("parameters read out, target: %s, exec path: %s\n", g_target_so, g_main_dir);
 
-	fclose(fp);
+	char feedback[3] = "OK";
+
+	int feedback_fd = open(tick_fifo, O_WRONLY);
+	if(feedback_fd >= 0) 
+	{
+		write(feedback_fd, feedback, 2);
+		close(feedback_fd);
+	}
+
+	close(pass_fd);
+	return 0;
+}
+
+// Parameter format is:  "PATH:/local/path/|LIBS:lib1.so,lib2.so|"
+int parse_parameters(char * buffer, int len)
+{
+	char * substr = buffer;
+
+	char * colon = strchr(substr, ':');
+	char * separator = strchr(substr, '|');
+	
+	while(separator != NULL)
+	{
+		if(strncmp(substr, "PATH", colon - substr) == 0)
+		{
+			strncpy(g_main_dir, colon + 1, separator - colon - 1);
+			g_main_dir[separator - colon - 1] = 0;
+		}
+		else if(strncmp(substr, "LIBS", colon - substr) == 0)
+		{
+			strncpy(g_target_so, colon + 1, separator - colon - 1);
+			g_target_so[separator - colon - 1] = 0;
+		}
+
+		substr = separator + 1;
+		colon = strchr(substr, ':');
+		separator = strchr(substr, '|');
+	}
+
 	return 0;
 }
 

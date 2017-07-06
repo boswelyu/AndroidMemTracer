@@ -10,9 +10,11 @@
 #include <sys/ptrace.h>    
 #include <sys/wait.h>    
 #include <sys/mman.h>  
-#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <dlfcn.h>    
 #include <dirent.h>    
 #include <unistd.h>    
@@ -22,15 +24,25 @@
 #include <ptraceInject.h>
 #include <utils/logger.h>
 
+typedef struct push_data_struct
+{
+	char * content;
+	int contentLen;
+}PushData;
+
 int parse_command_options(int argc, char * argv[]);
 int pass_parameters(char * targetso, char * modulefullpath, int maxlen);
 int start_commander();
 void *feedback_listener(void * param);
+void *push_worker(void * param);
 
 void print_usage(char * processName) {
 	printf("Usage: %s -p PID -t TargetSoName\n", processName);
 	printf("	Note: Need put one copy of your target so file under your memtracer execute path.\n");
 }
+
+const char pass_fifo[] = "/data/data/memtracer_pass.fifo";
+const char tick_fifo[] = "/data/data/memtracer_tick.fifo";
 
 // Input Options
 pid_t pid;
@@ -58,6 +70,8 @@ int main(int argc, char *argv[]) {
 	}
 
 	snprintf(InjectModuleName, MAX_PATH, "%s/libmemtracer.so", exec_path);
+
+	sleep(1);
 
 	// 当前设备环境判断
 	#if defined(__i386__)  
@@ -135,29 +149,75 @@ int parse_command_options(int argc, char * argv[])
 // 因为Android不支持IPC的进程间通信方式，这里把参数都写入固定的临时文件
 int pass_parameters(char * targetso, char * execpath, int maxlen)
 {
-	const char temp_file[MAX_PATH] = "/sdcard/tmp/memtracer/param_pass.swp";
-	FILE * fp = fopen(temp_file, "w");
-	if(fp == NULL) 
+	if(mkfifo(pass_fifo, O_CREAT | 0777) < 0 && errno != EEXIST)
 	{
-		printf("Create temp file to pass parameter failed, error: %s\n", strerror(errno));
+		printf("Create Pass FIFO Failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if(mkfifo(tick_fifo, O_CREAT | 0777) < 0 && errno != EEXIST)
+	{
+		printf("Create Tick FIFO Failed: %s\n", strerror(errno));
 		return -1;
 	}
 
 	char * ret = getcwd(execpath, maxlen - 20);
 	if(ret == NULL) {
 		printf("Get Current Working Path Failed, Error: %s\n", strerror(errno));
-		fclose(fp);
 		return -1;
 	}
 
-	fputs(targetso, fp);
-	fputs("\n", fp);
-	fputs(execpath, fp);
+	char content[1024] = {0};
+	int conlen = snprintf(content, 1023, "PATH:%s|LIBS:%s|", execpath, targetso);
+	content[conlen] = 0;
 
-	fflush(fp);
-	fclose(fp);
+	pthread_t push_thread;
+	PushData * push_data = (PushData *)malloc(sizeof(PushData));
+	push_data->content = content;
+	push_data->contentLen = conlen;
+
+	pthread_create(&push_thread, NULL, push_worker, (void *)push_data);
 
 	return 0;
+}
+
+void * push_worker(void * param)
+{
+	PushData * push_data = (PushData *)param;
+	char *content = push_data->content;
+	int conlen = push_data->contentLen;
+
+	// 阻塞地等待客户端打开只读管道，一旦有客户端连接进来，就Push参数给他
+	int push_fd = open(pass_fifo, O_WRONLY);
+	if(push_fd < 0)
+	{
+		printf("Open Pass FIFO file failed: %s\n", strerror(errno));
+		return (void *)-1;
+	}
+
+	int sendbytes = write(push_fd, content, conlen + 1);
+	if(sendbytes < 0)
+	{
+		printf("Push content to client failed: %s\n", strerror(errno));
+		return (void *)-1;
+	}
+
+	int tick_fd = open(tick_fifo, O_RDONLY);
+	if(tick_fd < 0)
+	{
+		printf("Open Feedback FIFO file failed: %s\n", strerror(errno));
+		return (void *)-1;
+	}
+
+	char feedback[128] = {0};
+	int readbytes = read(tick_fd, feedback, sizeof(feedback));
+	feedback[readbytes] = 0;
+	printf("Client reply: %s\n", feedback);
+
+	close(push_fd);
+	close(tick_fd);
+
+	return NULL;
 }
 
 // 打开socket给注入后的memtracer发送控制命令，并接收反馈
