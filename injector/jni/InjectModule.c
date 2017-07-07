@@ -31,7 +31,7 @@ typedef struct push_data_struct
 }PushData;
 
 int parse_command_options(int argc, char * argv[]);
-int pass_parameters(char * targetso, char * modulefullpath, int maxlen);
+pthread_t pass_parameters(char * targetso, char * modulefullpath, int maxlen);
 int start_commander();
 void *feedback_listener(void * param);
 void *push_worker(void * param);
@@ -41,13 +41,13 @@ void print_usage(char * processName) {
 	printf("	Note: Need put one copy of your target so file under your memtracer execute path.\n");
 }
 
-const char pass_fifo[] = "/data/data/memtracer_pass.fifo";
-const char tick_fifo[] = "/data/data/memtracer_tick.fifo";
-
 // Input Options
 pid_t pid;
 char * targetSoName = NULL;
-unsigned int socket_port = 7788;
+const unsigned int push_port = 7878;
+const unsigned int socket_port = 7788;
+
+int push_thread_started = 0;
 
 int main(int argc, char *argv[]) {
 
@@ -58,46 +58,60 @@ int main(int argc, char *argv[]) {
 	}
 
 	char RemoteCallFunc[MAX_PATH] = "memtracer_entry";              // 注入模块后调用模块函数名称
-	char exec_path[MAX_PATH];
 	char InjectModuleName[MAX_PATH]; //= "/data/local/inject/libmemtracer.so";    // 注入模块全路径
 
-	// 获取执行参数，把参数填入共享内存，并把共享内存ID传递给注入进程
-	int iRet = pass_parameters(targetSoName, exec_path, MAX_PATH);
-	if( iRet < 0) 
-	{
-		printf("Pass Parameter Failed!\n");
+	char exec_path[MAX_PATH];
+	char *ret = getcwd(exec_path, MAX_PATH - 20);
+	if(ret == NULL) {
+		printf("Get Current Working Path Failed, Error: %s\n", strerror(errno));
 		return -1;
 	}
 
-	snprintf(InjectModuleName, MAX_PATH, "%s/libmemtracer.so", exec_path);
+	// 获取执行参数，把参数填入共享内存，并把共享内存ID传递给注入进程
+	pthread_t push_td = pass_parameters(targetSoName, exec_path, sizeof(exec_path));
+	if( push_td == (pthread_t)-1) 
+	{
+		printf("Create Pass Parameter Thread Failed!\n");
+		return -1;
+	}
 
-	sleep(1);
+	while(push_thread_started == 0)
+	{
+		usleep(1000);
+	}
+	printf("Push thread started success!");
+
+	usleep(3000);
+
+	snprintf(InjectModuleName, MAX_PATH, "%s/libmemtracer.so", exec_path);
+	printf("Wait for injected module process\n");
 
 	// 当前设备环境判断
 	#if defined(__i386__)  
-	LOGD("Current Environment x86");
+	LOGI("Current Environment x86\n");
 	return -1;
 	#elif defined(__arm__)
-	LOGD("Current Environment ARM");
+	LOGI("Current Environment ARM\n");
 	#else     
-	LOGD("other Environment");
+	LOGI("other Environment\n");
 	return -1;
 	#endif
 	
 	printf("begin inject process, RemoteProcess pid:%d, InjectModuleName:%s, RemoteCallFunc:%s\n", pid, InjectModuleName, RemoteCallFunc);
 
-	iRet = inject_remote_process(pid,  InjectModuleName, RemoteCallFunc, (long *)&socket_port, 1);
+	int iRet = inject_remote_process(pid,  InjectModuleName, RemoteCallFunc, (long *)&socket_port, 1);
 	
-	if (iRet == 0)
-	{
-		printf("Inject Success\n");
-		start_commander();
-	}
-	else
+	if (iRet != 0)
 	{
 		printf("Inject Failed\n");
+		return -1;
 	}
 
+	pthread_join(push_td, NULL);
+	printf("Target has read out the parameters\n");
+
+	printf("Inject Success\n");
+	start_commander();
 
     return 0;  
 }  
@@ -147,38 +161,23 @@ int parse_command_options(int argc, char * argv[])
 
 // 给注入模块传递运行时参数，包括目标链接库名字和程序运行路径
 // 因为Android不支持IPC的进程间通信方式，这里把参数都写入固定的临时文件
-int pass_parameters(char * targetso, char * execpath, int maxlen)
+pthread_t pass_parameters(char * targetso, char * execpath, int maxlen)
 {
-	if(mkfifo(pass_fifo, O_CREAT | 0777) < 0 && errno != EEXIST)
-	{
-		printf("Create Pass FIFO Failed: %s\n", strerror(errno));
-		return -1;
-	}
-
-	if(mkfifo(tick_fifo, O_CREAT | 0777) < 0 && errno != EEXIST)
-	{
-		printf("Create Tick FIFO Failed: %s\n", strerror(errno));
-		return -1;
-	}
-
-	char * ret = getcwd(execpath, maxlen - 20);
-	if(ret == NULL) {
-		printf("Get Current Working Path Failed, Error: %s\n", strerror(errno));
-		return -1;
-	}
-
-	char content[1024] = {0};
+	char *content = (char *)malloc(1024);
 	int conlen = snprintf(content, 1023, "PATH:%s|LIBS:%s|", execpath, targetso);
 	content[conlen] = 0;
+
+	printf("Content Ready: %s, start push thread\n", content);
 
 	pthread_t push_thread;
 	PushData * push_data = (PushData *)malloc(sizeof(PushData));
 	push_data->content = content;
 	push_data->contentLen = conlen;
 
+    LOGI("Start Create Push Thread!");
 	pthread_create(&push_thread, NULL, push_worker, (void *)push_data);
 
-	return 0;
+	return push_thread;
 }
 
 void * push_worker(void * param)
@@ -187,35 +186,54 @@ void * push_worker(void * param)
 	char *content = push_data->content;
 	int conlen = push_data->contentLen;
 
-	// 阻塞地等待客户端打开只读管道，一旦有客户端连接进来，就Push参数给他
-	int push_fd = open(pass_fifo, O_WRONLY);
-	if(push_fd < 0)
+	int push_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if(push_sockfd < 0)
 	{
-		printf("Open Pass FIFO file failed: %s\n", strerror(errno));
-		return (void *)-1;
+		printf("Create INET socket failed\n");
+		return NULL;
 	}
 
-	int sendbytes = write(push_fd, content, conlen + 1);
-	if(sendbytes < 0)
+	struct sockaddr_in push_addr;
+	push_addr.sin_family = AF_INET;
+	push_addr.sin_port = htons(push_port);
+	push_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+	if(bind(push_sockfd, (struct sockaddr *)&push_addr, sizeof(push_addr)) == -1)
 	{
-		printf("Push content to client failed: %s\n", strerror(errno));
-		return (void *)-1;
+		printf("Bind to network interface failed: %s\n", strerror(errno));
+		return NULL;
 	}
 
-	int tick_fd = open(tick_fifo, O_RDONLY);
-	if(tick_fd < 0)
-	{
-		printf("Open Feedback FIFO file failed: %s\n", strerror(errno));
-		return (void *)-1;
+	printf("Wait for target connect in to read parameters\n");
+	push_thread_started = 1;
+
+	if(listen(push_sockfd, 1) == -1) {
+		printf("Listen error: %s\n", strerror(errno));
+		return NULL;
 	}
+
+	struct sockaddr_in client_addr;
+	int clientlen = sizeof(client_addr);
+
+	int connfd = accept(push_sockfd, (struct sockaddr *)&client_addr, &clientlen);
+	if(connfd < 0)
+	{
+		printf("Accept failed: %s\n", strerror(errno));
+		return NULL;
+	}
+
+	// Has one client connected in, push parameters to it
+	send(connfd, content, conlen, 0);
+
+	printf("parameters pushed to client: %s\n", content);
 
 	char feedback[128] = {0};
-	int readbytes = read(tick_fd, feedback, sizeof(feedback));
+	int readbytes = recv(connfd, feedback, sizeof(feedback), 0);
 	feedback[readbytes] = 0;
 	printf("Client reply: %s\n", feedback);
 
-	close(push_fd);
-	close(tick_fd);
+	close(connfd);
+	close(push_sockfd);
 
 	return NULL;
 }

@@ -21,6 +21,7 @@ const char tick_fifo[] = "/data/data/memtracer_tick.fifo";
 
 int read_parameters();
 void post_process_str(char * strbuf, int maxlen);
+void * hook_worker(void * param);
 void * command_listener(void * param);
 
 int parse_target_library(const char *targetdir, const char *targetsoname);
@@ -30,7 +31,8 @@ int do_got_hook(void *symbol, void *new_function, void **old_function);
 
 char g_target_so[MAX_PATH_LEN];
 char g_main_dir[MAX_PATH_LEN];
-int  g_socket_port = 7788;
+const int g_push_port = 7878;
+int g_socket_port = 7788;
 uint32_t g_GotTableStartaddr = 0;
 uint32_t g_GotTableSize = 0;
 uint32_t g_base = 0;
@@ -70,11 +72,6 @@ int memtracer_entry(long * param)
 
 	LOGD("Start MemTracer Init with port: %d\n", g_socket_port);
 
-	if(read_parameters() != 0) {
-		LOGE("MemTracer Read Runtime Parameters Failed!");
-		return -1;
-	}
-
 	if(memtracer_init(20000) != 0)
 	{
 		LOGE("MemTracer Init Failed!");
@@ -82,79 +79,62 @@ int memtracer_entry(long * param)
 	}
 
 	// Start one thread to listen control command
-	pthread_t ptd;
-	pthread_create(&ptd, NULL, command_listener, NULL);
+	pthread_t cmd_ptd;
+	pthread_create(&cmd_ptd, NULL, command_listener, NULL);
+
+	pthread_t hook_ptd;
+	pthread_create(&hook_ptd, NULL, hook_worker, NULL);
 	
+	LOGI("Memtracer_entry finished");
+	return 0;
+}
+
+void * hook_worker(void * param)
+{
+	LOGI("Hook Worker Thread Started, wait 1 second to start work");
+	sleep(1);
+
+	if(read_parameters() != 0) {
+		LOGE("MemTracer Read Runtime Parameters Failed!");
+		return NULL;
+	}
+
 	int iret;
 	iret = parse_target_library(g_main_dir, g_target_so);
 	if(iret != 0)
 	{
 		LOGE("Parse Library File Failed!");
-		return -1;
+		return NULL;
 	}
 
 	iret = do_got_hook((void *)calloc, (void *)replaced_calloc, (void **)&orig_calloc);
 	if(iret != 0)
 	{
 		LOGE("MemTracer hook function calloc failed!");
-		return -1;
+		return NULL;
 	}
 
 	iret = do_got_hook((void *)malloc, (void *)replaced_malloc, (void **)&orig_malloc);
 	if(iret != 0) {
 		LOGE("MemTracer hook function malloc failed!");
-		return -1;
+		return NULL;
 	}
 
 	iret = do_got_hook((void *)realloc, (void *)replaced_realloc, (void **)&orig_realloc);
 	if(iret != 0)
 	{
 		LOGE("MemTracer hook function realloc failed!");
-		return -1;
+		return NULL;
 	}
 
 	iret = do_got_hook((void *)free, (void *)replaced_free, (void **)&orig_free);
 	if(iret != 0)
 	{
 		LOGE("MemTracer hook function free failed!");
-		return -1;
+		return NULL;
 	}
 
-
-
-	return 0;
-}
-
-/* 
- * 从共享内存中读取必要的参数，包括：
- * 1 - 执行hook的目标库文件名
- * 2 - 母程序的执行路径
- */
-int read_parameters() 
-{	
-	// 打开只读管道读取运行参数
-	int pass_fd = open(pass_fifo, O_RDONLY);
-	if(pass_fd < 0) {
-		LOGE("Open Pass FIFO Failed: %s\n", strerror(errno));
-		return -1;
-	}
-
-	char buffer[1024];
-	int readbytes = read(pass_fd, buffer, sizeof(buffer));
-	if(readbytes == -1)
-	{
-		LOGE("Read data failed: %s", strerror(errno));
-		return -1;
-	}
-
-	if(parse_parameters(buffer, readbytes) == -1)
-	{
-		LOGE("Parse Parameters from server failed");
-		return -1;
-	}
-
-	LOGI("parameters read out, target: %s, exec path: %s\n", g_target_so, g_main_dir);
-
+	// Hook finished, feedback injector
 	char feedback[3] = "OK";
 
 	int feedback_fd = open(tick_fifo, O_WRONLY);
@@ -164,7 +144,60 @@ int read_parameters()
 		close(feedback_fd);
 	}
 
-	close(pass_fd);
+	return NULL;
+}
+
+int hardcode_parameters()
+{
+	char path[] = "/data/local/memtracer";
+	char libs[] = "libunity.so";
+	strncpy(g_main_dir, path, sizeof(g_main_dir));
+	strncpy(g_target_so, libs, sizeof(g_target_so));
+	return 0;
+}
+
+/* 
+ * 从管道中读取必要的参数，包括：
+ * 1 - 执行hook的目标库文件名
+ * 2 - 母程序的执行路径
+ */
+int read_parameters() 
+{	
+	// 打开stream socket读取运行参数
+
+	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+
+	struct sockaddr_in servaddr;
+	memset(&servaddr, 0, sizeof(servaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_port = htons(g_push_port);
+	servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+	if(connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+	{
+		LOGE("Connect to server failed, error: %s\n", strerror(errno));
+		return -1;
+	}
+
+	LOGI("Connect to push server success, start read parameter");
+	char readbuffer[1024];
+	int readbytes = recv(sockfd, readbuffer, sizeof(readbuffer), 0);
+	readbuffer[readbytes] = 0;
+
+	LOGI("Received Parameters: %s", readbuffer);
+
+	if(parse_parameters(readbuffer, readbytes) == -1)
+	{
+		LOGE("Parse Parameters from server failed");
+		return -1;
+	}
+
+	LOGI("parameters read out, target: %s, exec path: %s\n", g_target_so, g_main_dir);
+
+	char sendbuf[8] = "OK";
+	send(sockfd, sendbuf, strlen(sendbuf), 0);
+
+	close(sockfd);
 	return 0;
 }
 
