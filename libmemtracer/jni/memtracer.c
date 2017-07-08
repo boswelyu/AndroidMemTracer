@@ -270,16 +270,13 @@ void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, s
         return NULL;
     }
 
-    LOGI("Realloc on addr: %p, new size: %d", ptr, size);
-
-    if(*(unsigned int *)((char *)ptr - 3 * sizeof(unsigned int)) != MAGIC_NUM ||
-        *(unsigned int *)((char *)ptr - 4 * sizeof(unsigned int)) != MAGIC_NUM)
+    void * realaddr = (void *)((char *)ptr - sizeof(MemControlBlock));
+    MemControlBlock * ctrl_ptr = (MemControlBlock *)(realaddr);
+    if(ctrl_ptr->magic_num1 != MAGIC_NUM || ctrl_ptr->magic_num2 != MAGIC_NUM)
     {
         // Not trace malloc or calloc allocated memory
         return orig_realloc(ptr, size);
     }
-    
-    void * realaddr = (void *)((char *)ptr - sizeof(MemControlBlock));
 
     void * newaddr = orig_realloc(realaddr, size + sizeof(MemControlBlock));
 
@@ -332,21 +329,18 @@ int is_valid_address(void * addr)
 void trace_free(void * ptr, void (*orig_free)(void * addr))
 {
     // TODO: Check if address is valid
-	if(*(unsigned int *)((char *)ptr - 3* sizeof(unsigned int)) != MAGIC_NUM ||
-        *(unsigned int *)((char *)ptr - 4 * sizeof(unsigned int)) != MAGIC_NUM ) 
+    char * trace_addr = (char *)ptr - sizeof(MemControlBlock);
+    MemControlBlock * ctrl_block = (MemControlBlock *)trace_addr;
+
+	if( ctrl_block->magic_num1 != MAGIC_NUM || ctrl_block->magic_num2 != MAGIC_NUM ) 
     {
         if(g_simple_mode == 1) {
             g_traced_count--;
         }
-        LOGI("Not Traced Memory, Use Original Free: %p", ptr);
-
         orig_free(ptr);
     }
     else
     {
-        char * trace_addr = (char *)ptr - sizeof(MemControlBlock);
-        MemControlBlock * ctrl_block = (MemControlBlock *)trace_addr;
-
         if(ctrl_block->preholder != 0) {
             LOGE("+++++++++++++ Memory overflow detected +++++++++++");
         }
@@ -454,11 +448,15 @@ int dump_leaked_memory(char * feedback, int maxlen)
                 dump_content(formatbuffer, dumptofile);
             }
 
-            for(j = 0; j < ctrlBlock->bt_depth; j++)
+            if(ctrlBlock->bt_depth > MAX_DEPTH) 
+            {
+                sprintf(formatbuffer, "************* Memory Control Block Destroied ***************");
+                dump_content(formatbuffer, dumptofile);
+            }
+            for(j = 0; j < ctrlBlock->bt_depth && j < MAX_DEPTH; j++)
             {
                 dump_backtrace((unsigned int)ctrlBlock->backtrace[j], formatbuffer, sizeof(formatbuffer));
                 dump_content(formatbuffer, dumptofile);
-                
             }
             counter++;
         }
