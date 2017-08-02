@@ -6,15 +6,10 @@
 
 typedef struct memCtrlBlock
 {
-	unsigned int preholder;
-    int block_index;
+    void * addr_ptr;
     int size;
     int bt_depth;
-    int flag;
     void * backtrace[MAX_DEPTH];
-    unsigned int magic_num1;
-    unsigned int magic_num2;
-    unsigned int postholder;
 }MemControlBlock;
 
 int memtracer_init(int size);
@@ -43,6 +38,10 @@ int switch_simple_mode(char * feedback, int maxlen);
 int switch_backtrace_mode(char * feedback, int maxlen);
 
 int dump_leaked_memory(char * feedback, int maxlen);
+
+int is_valid_address(void * addr);
+
+int address_within_range(void * addr);
 
 
 #endif

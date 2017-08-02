@@ -16,7 +16,6 @@
 
 #define MAX_PATH_LEN 256
 
-const char pass_fifo[] = "/data/data/memtracer_pass.fifo";
 const char tick_fifo[] = "/data/data/memtracer_tick.fifo";
 
 int read_parameters();

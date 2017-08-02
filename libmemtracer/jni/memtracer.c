@@ -9,8 +9,10 @@
 // Forward declare of internal function
 void dump_content(char * content, int dumptofile);
 void add_map_element(unsigned int startaddr, unsigned int endaddr, char * libname);
+void record_valid_address(unsigned int startaddr, unsigned endaddr);
 void dump_backtrace(unsigned int addr, char * buffer, int maxlen);
 char * find_last(char * str, char ch);
+void record_min_address(void *addr);
 
 // ========== 记录函数调用序列 ==========
 typedef struct backtraceState
@@ -52,10 +54,9 @@ size_t capture_backtrace(void** buffer)
 
 // =============================================================================
 
-void ** g_blocks_ptr = NULL;
+MemControlBlock * g_blocks_ptr = NULL;
 int     g_block_count = 0;
 int     g_block_index = 0;
-
 int     g_traced_count = 0;
 
 // External Control flags
@@ -69,6 +70,12 @@ MMapDataCell * g_mmaps_data;
 int     g_mmaps_cap = 128;
 int     g_mmaps_count = 0;
 
+// 有效地址范围
+unsigned int g_lower_address = 0;
+unsigned int g_upper_address = 0;
+
+unsigned int g_min_addr = 0xFFFFFFFF;
+
 
 char dump_file_name[128] = "/sdcard/tmp/memtracer/check_result.txt";
 FILE * memtrace_file = NULL;
@@ -78,18 +85,17 @@ void * (*original_malloc)(size_t size);
 int memtracer_init(int size)
 {
     original_malloc = malloc;
-    g_blocks_ptr = (void* *)malloc(sizeof(void *) * size);
+    g_blocks_ptr = (MemControlBlock *)malloc(sizeof(MemControlBlock) * size);
     if(g_blocks_ptr == NULL) {
         LOGE("Allocate Memory For CtrlBlockState array Failed!");
         return -1;
     }
+    memset(g_blocks_ptr, 0, sizeof(MemControlBlock) * size);
 
     memtrace_file = fopen(dump_file_name, "w");
     if(memtrace_file == NULL) {
         LOGE("Create memtrace dump file %s failed, errno: %d, info: %s\n", dump_file_name, errno, strerror(errno));
     }
-
-    memset(g_blocks_ptr, 0, sizeof(void *) * size);
 
     g_block_count = size;
     g_block_index = 0;
@@ -106,7 +112,7 @@ int memtracer_init(int size)
 // 重新开始内存跟踪，清理掉已经跟踪到的内存
 int reset_memtracer(char * feedback, int maxlen)
 {
-    memset(g_blocks_ptr, 0, sizeof(void *) * g_block_count);
+    memset(g_blocks_ptr, 0, sizeof(MemControlBlock) * g_block_count);
     g_block_index= 0;
     g_traced_count = 0;
     return snprintf(feedback, maxlen, "Memtracer Reset Done");
@@ -124,19 +130,20 @@ void interpret_mmaps()
     if (fp != NULL) 
     {
         while (fgets(line, sizeof(line), fp)) 
-        {
-            if (strstr(line, ".so"))
+        {    
+            char * fmins = index(line, '-');
+            strncpy(buff, line, fmins - line);
+            buff[fmins - line] = 0;
+            unsigned int startaddr = strtoul(buff, NULL, 16);
+
+            char * fspace = index(line, ' ');
+            strncpy(buff, fmins + 1, fspace - fmins - 1);
+            buff[fspace - fmins - 1] = 0;
+            unsigned int endaddr = strtoul(buff, NULL, 16);
+
+            record_valid_address(startaddr, endaddr);
+            if(strstr(line, ".so"))
             {
-                char * fmins = index(line, '-');
-                strncpy(buff, line, fmins - line);
-                buff[fmins - line] = 0;
-                unsigned int startaddr = strtoul(buff, NULL, 16);
-
-                char * fspace = index(line, ' ');
-                strncpy(buff, fmins + 1, fspace - fmins - 1);
-                buff[fspace - fmins - 1] = 0;
-                unsigned int endaddr = strtoul(buff, NULL, 16);
-
                 char * libname = find_last(line, ' ');
                 if(libname != NULL) {
                     post_process_str(libname, strlen(libname));
@@ -154,14 +161,14 @@ void interpret_mmaps()
 int get_control_block()
 {
     int curr_index = g_block_index;
-    if(g_blocks_ptr[curr_index] == NULL)
+    if(g_blocks_ptr[curr_index].addr_ptr == NULL)
     {
         return curr_index;
     }
     else {
         for(curr_index = (curr_index + 1) % g_block_count; curr_index != g_block_index; curr_index = (curr_index + 1) % g_block_count)
         {
-            if(g_blocks_ptr[curr_index] == NULL)
+            if(g_blocks_ptr[curr_index].addr_ptr == NULL)
             {
                 return curr_index;
             }
@@ -174,15 +181,20 @@ int get_control_block()
 
 void * trace_calloc(size_t blocks, size_t size, void * (*orig_calloc)(size_t blocks, size_t size), void * (orig_malloc)(size_t len))
 {
+    void * retaddr;
     if(g_trace_enabled == 0)
     {
-        return orig_calloc(blocks, size);
+        retaddr = orig_calloc(blocks, size);
+        record_min_address(retaddr);
+        return retaddr;
     }
 
     if(g_simple_mode == 1)
     {
         g_traced_count++;
-        return orig_calloc(blocks, size);
+        retaddr = orig_calloc(blocks, size);
+        record_min_address(retaddr);
+        return retaddr;
     }
 
     void * ptr = trace_malloc(blocks * size, orig_malloc);
@@ -194,16 +206,21 @@ void * trace_calloc(size_t blocks, size_t size, void * (*orig_calloc)(size_t blo
 // 跟踪所有已经分配的内存
 void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
 {
+    void * retaddr;
     if(g_trace_enabled == 0)
     {
         // Record Not started Yet
-        return orig_malloc(size);
+        retaddr = orig_malloc(size);
+        record_min_address(retaddr);
+        return retaddr;
     }
 
     if(g_simple_mode == 1) {
         // 简易模式，只记录数值，不增加跟踪控制块
         g_traced_count++;
-        return orig_malloc(size);
+        retaddr = orig_malloc(size);
+        record_min_address(retaddr);
+        return retaddr;
     }
 
     void * buffer[MAX_DEPTH];
@@ -219,41 +236,36 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
         return orig_malloc(size);
     }
 
-    size_t newsize = size + sizeof(MemControlBlock);
-    void * addr = orig_malloc(newsize);
+    void * addr = orig_malloc(size + 4);
+    if(addr == NULL)
+    {
+        LOGE("Allocate memory failed with size: %d\n", size);
+        return NULL;
+    }
 
-    // 填充COntrolBlock信息
-    MemControlBlock * ctrlBlock = (MemControlBlock *)addr;
-    ctrlBlock->preholder = 0;
-    ctrlBlock->block_index = free_block_index;
+    record_min_address(addr);
+
+    *(int *)addr = free_block_index;
+
+    retaddr = (void *)((char *)addr + 4);
+
+    MemControlBlock * ctrlBlock = &g_blocks_ptr[free_block_index];
+    ctrlBlock->addr_ptr = retaddr;
     ctrlBlock->size = size;
-    ctrlBlock->magic_num1 = MAGIC_NUM;
-    ctrlBlock->magic_num2 = MAGIC_NUM;
-    ctrlBlock->postholder = 0;
+    ctrlBlock->bt_depth = 0;
 
     // 填充ControlBlock的信息
     if(g_trace_func_call != 0) {
         memcpy(ctrlBlock->backtrace, buffer + 2, (bt_depth - 2) * sizeof(void *));
         ctrlBlock->bt_depth = bt_depth - 2;
-
-        // LOGI("-- Allocate %d(%d) bytes, btdepth: %d", newsize, size, bt_depth);
-        // int i = 0;
-        // for(i = 0; i < bt_depth; i++)
-        // {
-        //     LOGI("      BT: %p", buffer[i]);
-        // }
     }
-    
-    char * retaddr = (char *)addr + sizeof(MemControlBlock);
-    g_blocks_ptr[free_block_index] = retaddr;
 
     g_traced_count++;
 
     //LOGI("Memory Traced, Return Address: %p, Actual Malloced: %p", retaddr, addr);
 
-    return (void *)retaddr;
+    return retaddr;
 }
-
 
 
 void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, size_t size), 
@@ -266,104 +278,147 @@ void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, s
 
     if(size == 0)
     {
-        trace_free(ptr, orig_free);
+        //trace_free(ptr, orig_free);
         return NULL;
     }
 
-    void * realaddr = (void *)((char *)ptr - sizeof(MemControlBlock));
-    MemControlBlock * ctrl_ptr = (MemControlBlock *)(realaddr);
-    if(ctrl_ptr->magic_num1 != MAGIC_NUM || ctrl_ptr->magic_num2 != MAGIC_NUM)
+    void * retaddr;
+    if(g_trace_enabled == 0)
     {
-        // Not trace malloc or calloc allocated memory
-        return orig_realloc(ptr, size);
+        retaddr = orig_realloc(ptr, size);
+        record_min_address(retaddr);
+        return retaddr;
     }
 
-    void * newaddr = orig_realloc(realaddr, size + sizeof(MemControlBlock));
+    if(address_within_range((void *)((char *)ptr - 4)) == 0)
+    {
+        retaddr = orig_realloc(ptr, size);
+        record_min_address(retaddr);
+        return retaddr;
+    }
+
+    int ctrlBlockIndex = *(int *)((char *)ptr - 4);
+    if(ctrlBlockIndex < 0 || ctrlBlockIndex >= g_block_count)
+    {
+        retaddr = orig_realloc(ptr, size);
+        record_min_address(retaddr);
+        return retaddr;
+    }
+
+    MemControlBlock * ctrl_ptr = &g_blocks_ptr[ctrlBlockIndex];
+    if(ctrl_ptr->addr_ptr != ptr)
+    {
+        // Not trace malloc or calloc allocated memory
+        retaddr = orig_realloc(ptr, size);
+        record_min_address(retaddr);
+        return retaddr;
+    }
+
+    void * realaddr = (void *)((char *)ptr - 4);
+    void * newaddr = orig_realloc(realaddr, size + 4);
 
     if(newaddr == NULL)
     {
-        LOGE("Reallocate Failed With size: %d + %d", size, sizeof(MemControlBlock));
+        LOGE("Reallocate Failed With size: %d + 4", size);
     }
     else
     {
-        MemControlBlock * ctrl_block = (MemControlBlock *)newaddr;
-        ctrl_block->size = size;
-
-        if(newaddr != realaddr)
-        {
-            int block_index = ctrl_block->block_index;
-
-            if(block_index >= 0 && block_index < g_block_count)
-            {
-                if(g_blocks_ptr[block_index] == realaddr)
-                {
-                    g_blocks_ptr[block_index] = newaddr;
-                    LOGI("New Reallocated address: %p", newaddr);
-                }
-                else
-                {
-                    LOGE("Address error in realloc, block index: %d, recoreded address: %p, real address: %p",
-                        block_index, g_blocks_ptr[block_index], realaddr);
-                }
-            }
-            else 
-            {
-                LOGE("Invalid block index in realloc: %d", block_index);
-            }
-        }
+        record_min_address(newaddr);
+        *(int *)((char *)newaddr) = ctrlBlockIndex;
+        ctrl_ptr->addr_ptr = (void *)((char *)newaddr + 4);
+        ctrl_ptr->size = size;
     }
-    void * retaddr = (void *)((char *)newaddr + sizeof(MemControlBlock));
-    return retaddr;
-}
-
-int is_valid_address(void * addr)
-{
-    if((unsigned int)addr >= 0x10000000)
-    {
-        return 1;
-    }
-    return 0;
+    return (void *)((char *)newaddr + 4);
 }
 
 // 记录已经释放的内存
 void trace_free(void * ptr, void (*orig_free)(void * addr))
 {
-    // TODO: Check if address is valid
-    char * trace_addr = (char *)ptr - sizeof(MemControlBlock);
-    MemControlBlock * ctrl_block = (MemControlBlock *)trace_addr;
+    if(is_valid_address(ptr) != 1)
+    {
+        LOGE("Invalid Address to Free: %p\n", ptr);
+        return;
+    }
 
-	if( ctrl_block->magic_num1 != MAGIC_NUM || ctrl_block->magic_num2 != MAGIC_NUM ) 
+    if(address_within_range((void *)((char *)ptr - 4)) == 1)
+    {
+        int ctrlBlockIndex = *(int *)((char *)ptr - 4);
+        if(ctrlBlockIndex < 0 || ctrlBlockIndex >= g_block_count)
+        {
+            if(g_simple_mode == 1) {
+                g_traced_count--;
+            }
+            orig_free(ptr);
+        }
+        else
+        {
+            MemControlBlock * ctrl_block = &g_blocks_ptr[ctrlBlockIndex];
+            if(ctrl_block->addr_ptr == ptr) {
+                g_traced_count--;
+                memset(ctrl_block, 0, sizeof(MemControlBlock));
+
+                void * realaddr = (void *)((char *)ptr - 4);
+                orig_free(realaddr);
+            }
+            else
+            {
+                if(g_simple_mode == 1)
+                {
+                    g_traced_count--;
+                }
+                orig_free(ptr);
+            }
+        }
+    }
+    else
     {
         if(g_simple_mode == 1) {
             g_traced_count--;
         }
         orig_free(ptr);
     }
-    else
-    {
-        if(ctrl_block->preholder != 0) {
-            LOGE("+++++++++++++ Memory overflow detected +++++++++++");
-        }
-        if(ctrl_block->postholder != 0) {
-            LOGE("+++++++++++++ This block of memory has overflow +++++++++++");
-        }
+}
 
-        int block_index = ctrl_block->block_index;
-        if(block_index >= 0 && block_index < g_block_count) {
-            if(g_blocks_ptr[block_index] == ptr) {
-                g_blocks_ptr[block_index] = NULL;
-                g_traced_count--;
-            }
-        }
-        else {
-            LOGE("ERROR: Invalid Control Block Index: %d", block_index);
-        }
-        
-        if(is_valid_address((void *)trace_addr)) {
-            orig_free((void *)trace_addr);
-        }
+int is_valid_address(void * addr)
+{
+    if(g_lower_address == 0 || g_upper_address == 0)
+    {
+        LOGE("Address Bound Not Set Correct");
+        return 1;
     }
 
+    if(g_min_addr != 0xFFFFFFFF)
+    {
+        if((unsigned int)addr >= g_min_addr && (unsigned int)addr <= g_upper_address)
+        {
+            return 1;
+        }
+    }
+    else {
+        if((unsigned int)addr >= 0x10000000 && (unsigned int)addr <= g_upper_address)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int address_within_range(void * addr)
+{
+    if(g_min_addr == 0xFFFFFFFF)
+    {
+        return 1;
+    }
+
+    return (unsigned int)addr >= g_min_addr ? 1 : 0;
+}
+
+void record_min_address(void *addr)
+{
+    if((unsigned int)addr < g_min_addr)
+    {
+        g_min_addr = (unsigned int)addr;
+    }
 }
 
 int start_memtrace(char * feedback, int maxlen)
@@ -429,30 +484,13 @@ int dump_leaked_memory(char * feedback, int maxlen)
     int i, j, counter = 0;
     for(i = 0; i < g_block_count; i++) 
     {
-        if(g_blocks_ptr[i] != NULL) {
+        MemControlBlock * ctrlBlock = &g_blocks_ptr[i];        
+        if(ctrlBlock->addr_ptr != NULL) {
 
-            MemControlBlock * ctrlBlock = (MemControlBlock *)((char *)g_blocks_ptr[i] - sizeof(MemControlBlock));
             sprintf(formatbuffer, "    Memory Leaked at:%p, leaked size:%d, bt depth: %d\n", 
-                g_blocks_ptr[i], ctrlBlock->size, ctrlBlock->bt_depth);
+                ctrlBlock->addr_ptr, ctrlBlock->size, ctrlBlock->bt_depth);
             dump_content(formatbuffer, dumptofile);
 
-            if(ctrlBlock->postholder != 0)
-            {
-                sprintf(formatbuffer, "************** Memory Underflowed **************");
-                dump_content(formatbuffer, dumptofile);
-            }
-
-            if(ctrlBlock->preholder != 0)
-            {
-                sprintf(formatbuffer, "************** Detected other Memory Overflow **************");
-                dump_content(formatbuffer, dumptofile);
-            }
-
-            if(ctrlBlock->bt_depth > MAX_DEPTH) 
-            {
-                sprintf(formatbuffer, "************* Memory Control Block Destroied ***************");
-                dump_content(formatbuffer, dumptofile);
-            }
             for(j = 0; j < ctrlBlock->bt_depth && j < MAX_DEPTH; j++)
             {
                 dump_backtrace((unsigned int)ctrlBlock->backtrace[j], formatbuffer, sizeof(formatbuffer));
@@ -521,6 +559,33 @@ void add_map_element(unsigned int startaddr, unsigned int endaddr, char * libnam
     cellptr->endAddr = endaddr;
     strncpy(cellptr->libName, libname, 128);
     g_mmaps_count++;
+}
+
+void record_valid_address(unsigned int startaddr, unsigned endaddr)
+{
+    if(g_lower_address == 0)
+    {
+        g_lower_address = startaddr;
+    }
+    else
+    {
+        if(startaddr < g_lower_address)
+        {
+            g_lower_address = startaddr;
+        }
+    }
+
+    if(g_upper_address == 0)
+    {
+        g_upper_address = endaddr;
+    }
+    else
+    {
+        if(endaddr > g_upper_address)
+        {
+            g_upper_address = endaddr;
+        }
+    }
 }
 
 // Check which library the given address comes from
