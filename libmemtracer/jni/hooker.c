@@ -19,6 +19,7 @@
 const char tick_fifo[] = "/data/data/memtracer_tick.fifo";
 
 int read_parameters();
+int parse_parameters(char * buffer, int len);
 void post_process_str(char * strbuf, int maxlen);
 void * hook_worker(void * param);
 void * command_listener(void * param);
@@ -71,7 +72,7 @@ int memtracer_entry(long * param)
 
 	LOGD("Start MemTracer Init with port: %d\n", g_socket_port);
 
-	if(memtracer_init(20000) != 0)
+	if(memtracer_init(50000) != 0)
 	{
 		LOGE("MemTracer Init Failed!");
 		return -1;

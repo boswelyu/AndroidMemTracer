@@ -1,7 +1,7 @@
 #ifndef _MEM_TRACER_H_
 #define _MEM_TRACER_H_
 
-#define MAX_DEPTH 16
+#define MAX_DEPTH 13
 #define MAGIC_NUM 0xEFBACD89
 
 typedef struct memCtrlBlock

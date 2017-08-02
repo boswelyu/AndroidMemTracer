@@ -13,6 +13,7 @@ void record_valid_address(unsigned int startaddr, unsigned endaddr);
 void dump_backtrace(unsigned int addr, char * buffer, int maxlen);
 char * find_last(char * str, char ch);
 void record_min_address(void *addr);
+int get_free_index();
 
 // ========== 记录函数调用序列 ==========
 typedef struct backtraceState
@@ -55,14 +56,20 @@ size_t capture_backtrace(void** buffer)
 // =============================================================================
 
 MemControlBlock * g_blocks_ptr = NULL;
+unsigned int * g_free_ptrs = NULL;
 int     g_block_count = 0;
 int     g_block_index = 0;
 int     g_traced_count = 0;
+
+int     g_freed_index = 0;
 
 // External Control flags
 int     g_trace_enabled = 0;
 // 简易模式：只记录数值，不记录BT
 int     g_simple_mode = 0;
+// 快速记录模式，记录所有的分配和释放，需要依靠线下工具分析泄露的内存块
+int     g_qrecord_mode = 0;
+
 int     g_trace_func_call = 1;
 
 // 存储链接库地址范围
@@ -92,6 +99,14 @@ int memtracer_init(int size)
     }
     memset(g_blocks_ptr, 0, sizeof(MemControlBlock) * size);
 
+    g_free_ptrs = (unsigned int *)malloc(sizeof(unsigned int) * size);
+    if(g_free_ptrs == NULL)
+    {
+        LOGE("Allocate Memory for Free Ptr array failed!");
+        return -1;
+    }
+    memset(g_free_ptrs, 0, sizeof(unsigned int) * size);
+
     memtrace_file = fopen(dump_file_name, "w");
     if(memtrace_file == NULL) {
         LOGE("Create memtrace dump file %s failed, errno: %d, info: %s\n", dump_file_name, errno, strerror(errno));
@@ -101,6 +116,8 @@ int memtracer_init(int size)
     g_block_index = 0;
 
     g_traced_count = 0;
+
+    g_freed_index = 0;
 
     g_mmaps_data = (MMapDataCell *)malloc(sizeof(MMapDataCell) * g_mmaps_cap);
     memset(g_mmaps_data, 0, sizeof(MMapDataCell) * g_mmaps_cap);
@@ -179,6 +196,15 @@ int get_control_block()
     return -1;
 }
 
+int get_free_index()
+{
+    if(g_freed_index < g_block_count)
+    {
+        return g_freed_index;
+    }
+    return -1;
+}
+
 void * trace_calloc(size_t blocks, size_t size, void * (*orig_calloc)(size_t blocks, size_t size), void * (orig_malloc)(size_t len))
 {
     void * retaddr;
@@ -236,18 +262,31 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
         return orig_malloc(size);
     }
 
-    void * addr = orig_malloc(size + 4);
-    if(addr == NULL)
+    void * addr = NULL;
+
+    if(g_qrecord_mode == 0)
     {
-        LOGE("Allocate memory failed with size: %d\n", size);
-        return NULL;
+        addr = orig_malloc(size + 4);
+        if(addr == NULL)
+        {
+            LOGE("Allocate memory failed with size: %d\n", size);
+            return NULL;
+        }
+        *(int *)addr = free_block_index;
+        retaddr = (void *)((char *)addr + 4);
+        record_min_address(addr);
     }
-
-    record_min_address(addr);
-
-    *(int *)addr = free_block_index;
-
-    retaddr = (void *)((char *)addr + 4);
+    else
+    {
+        // quick record mode, don't change memory layout, just record the allocated memory
+        addr = orig_malloc(size);
+        if(addr == NULL)
+        {
+            LOGE("Allocate memory failed in quick record mode with size: %d\n", size);
+            return NULL;
+        }
+        retaddr = addr;
+    }
 
     MemControlBlock * ctrlBlock = &g_blocks_ptr[free_block_index];
     ctrlBlock->addr_ptr = retaddr;
@@ -290,45 +329,91 @@ void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, s
         return retaddr;
     }
 
-    if(address_within_range((void *)((char *)ptr - 4)) == 0)
+    if(g_qrecord_mode == 0)
     {
-        retaddr = orig_realloc(ptr, size);
-        record_min_address(retaddr);
-        return retaddr;
-    }
+        if(address_within_range((void *)((char *)ptr - 4)) == 0)
+        {
+            retaddr = orig_realloc(ptr, size);
+            record_min_address(retaddr);
+            return retaddr;
+        }
 
-    int ctrlBlockIndex = *(int *)((char *)ptr - 4);
-    if(ctrlBlockIndex < 0 || ctrlBlockIndex >= g_block_count)
-    {
-        retaddr = orig_realloc(ptr, size);
-        record_min_address(retaddr);
-        return retaddr;
-    }
+        int ctrlBlockIndex = *(int *)((char *)ptr - 4);
+        if(ctrlBlockIndex < 0 || ctrlBlockIndex >= g_block_count)
+        {
+            retaddr = orig_realloc(ptr, size);
+            record_min_address(retaddr);
+            return retaddr;
+        }
 
-    MemControlBlock * ctrl_ptr = &g_blocks_ptr[ctrlBlockIndex];
-    if(ctrl_ptr->addr_ptr != ptr)
-    {
-        // Not trace malloc or calloc allocated memory
-        retaddr = orig_realloc(ptr, size);
-        record_min_address(retaddr);
-        return retaddr;
-    }
+        MemControlBlock * ctrl_ptr = &g_blocks_ptr[ctrlBlockIndex];
+        if(ctrl_ptr->addr_ptr != ptr)
+        {
+            // Not trace malloc or calloc allocated memory
+            retaddr = orig_realloc(ptr, size);
+            record_min_address(retaddr);
+            return retaddr;
+        }
 
-    void * realaddr = (void *)((char *)ptr - 4);
-    void * newaddr = orig_realloc(realaddr, size + 4);
+        void * realaddr = (void *)((char *)ptr - 4);
+        void * newaddr = orig_realloc(realaddr, size + 4);
 
-    if(newaddr == NULL)
-    {
-        LOGE("Reallocate Failed With size: %d + 4", size);
+        if(newaddr == NULL)
+        {
+            LOGE("Reallocate Failed With size: %d + 4", size);
+        }
+        else
+        {
+            record_min_address(newaddr);
+            *(int *)((char *)newaddr) = ctrlBlockIndex;
+            ctrl_ptr->addr_ptr = (void *)((char *)newaddr + 4);
+            ctrl_ptr->size = size;
+        }
+        return (void *)((char *)newaddr + 4);
     }
     else
     {
-        record_min_address(newaddr);
-        *(int *)((char *)newaddr) = ctrlBlockIndex;
-        ctrl_ptr->addr_ptr = (void *)((char *)newaddr + 4);
-        ctrl_ptr->size = size;
+        // quick record mode, if the reallocated memory different with original one, record one extra free
+        void * buffer[MAX_DEPTH];
+        retaddr = orig_realloc(ptr, size);
+        int bt_depth = 0;
+
+        if(retaddr != ptr)
+        {
+            if(g_trace_func_call != 0) {
+                bt_depth = capture_backtrace(buffer);
+            }
+        }
+        int free_block_index = get_control_block();
+        if(free_block_index >= 0)
+        {
+            // Still have space to record malloc blocks
+            MemControlBlock * ctrlBlock = &g_blocks_ptr[free_block_index];
+            ctrlBlock->addr_ptr = retaddr;
+            ctrlBlock->size = size;
+            ctrlBlock->bt_depth = 0;
+
+            // 填充ControlBlock的信息
+            if(g_trace_func_call != 0) {
+                memcpy(ctrlBlock->backtrace, buffer + 2, (bt_depth - 2) * sizeof(void *));
+                ctrlBlock->bt_depth = bt_depth - 2;
+            }
+
+            // add one free record for old address
+            int freed_index = get_free_index();
+            if(freed_index < 0)
+            {
+                LOGE("No Space left to record freed memory address");
+            }
+            else
+            {
+                g_free_ptrs[freed_index] = (unsigned int)ptr;
+                g_freed_index++;
+            }
+        }
+
+        return retaddr;
     }
-    return (void *)((char *)newaddr + 4);
 }
 
 // 记录已经释放的内存
