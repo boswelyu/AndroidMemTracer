@@ -130,8 +130,11 @@ int memtracer_init(int size)
 int reset_memtracer(char * feedback, int maxlen)
 {
     memset(g_blocks_ptr, 0, sizeof(MemControlBlock) * g_block_count);
+    memset(g_free_ptrs, 0, sizeof(unsigned int) * g_block_count);
     g_block_index= 0;
     g_traced_count = 0;
+    g_freed_index = 0;
+
     return snprintf(feedback, maxlen, "Memtracer Reset Done");
 }
 
@@ -177,23 +180,35 @@ void interpret_mmaps()
 
 int get_control_block()
 {
-    int curr_index = g_block_index;
-    if(g_blocks_ptr[curr_index].addr_ptr == NULL)
+    if(g_qrecord_mode == 0)
     {
-        return curr_index;
-    }
-    else {
-        for(curr_index = (curr_index + 1) % g_block_count; curr_index != g_block_index; curr_index = (curr_index + 1) % g_block_count)
+        int curr_index = g_block_index;
+        if(g_blocks_ptr[curr_index].addr_ptr == NULL)
         {
-            if(g_blocks_ptr[curr_index].addr_ptr == NULL)
+            return curr_index;
+        }
+        else {
+            for(curr_index = (curr_index + 1) % g_block_count; curr_index != g_block_index; curr_index = (curr_index + 1) % g_block_count)
             {
-                return curr_index;
+                if(g_blocks_ptr[curr_index].addr_ptr == NULL)
+                {
+                    g_block_index = curr_index;
+                    return curr_index;
+                }
             }
         }
-    }
 
-    // No Available Controll Block Found
-    return -1;
+        // No Available Controll Block Found
+        return -1;
+    }
+    else
+    {
+        if(g_block_index >= 0 && g_block_index < g_block_count)
+        {
+            return g_block_index;
+        }
+        return -1;
+    }
 }
 
 int get_free_index()
@@ -301,6 +316,11 @@ void * trace_malloc(size_t size, void * (*orig_malloc)(size_t len))
 
     g_traced_count++;
 
+    if(g_qrecord_mode == 1)
+    {
+        g_block_index++;
+    }
+
     //LOGI("Memory Traced, Return Address: %p, Actual Malloced: %p", retaddr, addr);
 
     return retaddr;
@@ -317,7 +337,7 @@ void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, s
 
     if(size == 0)
     {
-        //trace_free(ptr, orig_free);
+        trace_free(ptr, orig_free);
         return NULL;
     }
 
@@ -378,12 +398,10 @@ void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, s
         retaddr = orig_realloc(ptr, size);
         int bt_depth = 0;
 
-        if(retaddr != ptr)
-        {
-            if(g_trace_func_call != 0) {
-                bt_depth = capture_backtrace(buffer);
-            }
+        if(g_trace_func_call != 0) {
+            bt_depth = capture_backtrace(buffer);
         }
+        
         int free_block_index = get_control_block();
         if(free_block_index >= 0)
         {
@@ -394,7 +412,7 @@ void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, s
             ctrlBlock->bt_depth = 0;
 
             // 填充ControlBlock的信息
-            if(g_trace_func_call != 0) {
+            if(g_trace_func_call != 0 && bt_depth > 2) {
                 memcpy(ctrlBlock->backtrace, buffer + 2, (bt_depth - 2) * sizeof(void *));
                 ctrlBlock->bt_depth = bt_depth - 2;
             }
@@ -410,6 +428,8 @@ void * trace_realloc(void *ptr, size_t size, void *(*orig_realloc)(void * ptr, s
                 g_free_ptrs[freed_index] = (unsigned int)ptr;
                 g_freed_index++;
             }
+
+            g_block_index++;
         }
 
         return retaddr;
@@ -425,42 +445,54 @@ void trace_free(void * ptr, void (*orig_free)(void * addr))
         return;
     }
 
-    if(address_within_range((void *)((char *)ptr - 4)) == 1)
+    if(g_qrecord_mode == 0)
     {
-        int ctrlBlockIndex = *(int *)((char *)ptr - 4);
-        if(ctrlBlockIndex < 0 || ctrlBlockIndex >= g_block_count)
+        if(address_within_range((void *)((char *)ptr - 4)) == 1)
+        {
+            int ctrlBlockIndex = *(int *)((char *)ptr - 4);
+            if(ctrlBlockIndex < 0 || ctrlBlockIndex >= g_block_count)
+            {
+                if(g_simple_mode == 1) {
+                    g_traced_count--;
+                }
+                orig_free(ptr);
+            }
+            else
+            {
+                MemControlBlock * ctrl_block = &g_blocks_ptr[ctrlBlockIndex];
+                if(ctrl_block->addr_ptr == ptr) {
+                    g_traced_count--;
+                    memset(ctrl_block, 0, sizeof(MemControlBlock));
+
+                    void * realaddr = (void *)((char *)ptr - 4);
+                    orig_free(realaddr);
+                }
+                else
+                {
+                    if(g_simple_mode == 1)
+                    {
+                        g_traced_count--;
+                    }
+                    orig_free(ptr);
+                }
+            }
+        }
+        else
         {
             if(g_simple_mode == 1) {
                 g_traced_count--;
             }
             orig_free(ptr);
         }
-        else
-        {
-            MemControlBlock * ctrl_block = &g_blocks_ptr[ctrlBlockIndex];
-            if(ctrl_block->addr_ptr == ptr) {
-                g_traced_count--;
-                memset(ctrl_block, 0, sizeof(MemControlBlock));
-
-                void * realaddr = (void *)((char *)ptr - 4);
-                orig_free(realaddr);
-            }
-            else
-            {
-                if(g_simple_mode == 1)
-                {
-                    g_traced_count--;
-                }
-                orig_free(ptr);
-            }
-        }
     }
     else
     {
-        if(g_simple_mode == 1) {
-            g_traced_count--;
+        int freed_index = get_free_index();
+        if(freed_index >= 0)
+        {
+            g_free_ptrs[freed_index] = (unsigned int)ptr;
+            g_freed_index++;
         }
-        orig_free(ptr);
     }
 }
 
@@ -522,11 +554,27 @@ int switch_simple_mode(char * feedback, int maxlen)
 {
     if(g_simple_mode == 0) {
         g_simple_mode = 1;
+        g_qrecord_mode = 0;
         return snprintf(feedback, maxlen, "Simple Mode Enabled");
     }
     else {
         g_simple_mode = 0;
         return snprintf(feedback, maxlen, "Simple Mode Disabled");
+    }
+}
+
+int switch_qrecord_mode(char * feedback, int maxlen)
+{
+    if(g_qrecord_mode == 0)
+    {
+        g_qrecord_mode = 1;
+        g_simple_mode = 0;
+        return snprintf(feedback, maxlen, "Quick Record Mode Enabled");
+    }
+    else
+    {
+        g_qrecord_mode = 0;
+        return snprintf(feedback, maxlen, "Quick Record Mode Disabled");
     }
 }
 
@@ -555,8 +603,7 @@ int dump_leaked_memory(char * feedback, int maxlen)
         dumptofile = 0;
     }
 
-
-    if(g_traced_count == 0) {
+    if(g_traced_count == 0 && g_qrecord_mode == 0) {
         return snprintf(feedback, maxlen, "Good! No Memory Leak!");
     }
 
@@ -564,36 +611,81 @@ int dump_leaked_memory(char * feedback, int maxlen)
         return snprintf(feedback, maxlen, "Simple Mode Enabled, %d blocks of memory leak recorded\n", g_traced_count);
     }
 
-    sprintf(formatbuffer, "==== %d blocks of memory leak detected ======\n", g_traced_count);
-    dump_content(formatbuffer, dumptofile);
     int i, j, counter = 0;
-    for(i = 0; i < g_block_count; i++) 
+    if(g_qrecord_mode == 0)
     {
-        MemControlBlock * ctrlBlock = &g_blocks_ptr[i];        
-        if(ctrlBlock->addr_ptr != NULL) {
+        sprintf(formatbuffer, "==== %d blocks of memory leak detected ======\n", g_traced_count);
+        dump_content(formatbuffer, dumptofile);    
+        for(i = 0; i < g_block_count; i++) 
+        {
+            MemControlBlock * ctrlBlock = &g_blocks_ptr[i];        
+            if(ctrlBlock->addr_ptr != NULL) {
 
-            sprintf(formatbuffer, "    Memory Leaked at:%p, leaked size:%d, bt depth: %d\n", 
-                ctrlBlock->addr_ptr, ctrlBlock->size, ctrlBlock->bt_depth);
-            dump_content(formatbuffer, dumptofile);
-
-            for(j = 0; j < ctrlBlock->bt_depth && j < MAX_DEPTH; j++)
-            {
-                dump_backtrace((unsigned int)ctrlBlock->backtrace[j], formatbuffer, sizeof(formatbuffer));
+                sprintf(formatbuffer, "    Memory Leaked at:%p, leaked size:%d, bt depth: %d\n", 
+                    ctrlBlock->addr_ptr, ctrlBlock->size, ctrlBlock->bt_depth);
                 dump_content(formatbuffer, dumptofile);
+
+                for(j = 0; j < ctrlBlock->bt_depth && j < MAX_DEPTH; j++)
+                {
+                    dump_backtrace((unsigned int)ctrlBlock->backtrace[j], formatbuffer, sizeof(formatbuffer));
+                    dump_content(formatbuffer, dumptofile);
+                }
+                counter++;
             }
-            counter++;
+        }
+
+        LOGI("Recorded Counter: %d, Looped Counter: %d\n", g_traced_count, counter);
+
+        if(dumptofile) {
+            fflush(memtrace_file);
+
+            return snprintf(feedback, maxlen, ">> %d blocks of memory leak detected, details dumped to file %s", g_traced_count, dump_file_name);
+        }
+
+        return snprintf(feedback, maxlen, ">> %d blocks of memory leak detected, details dumped to logcat.", g_traced_count);
+    }
+    else
+    {
+        sprintf(formatbuffer, "================== Recorded Malloc Blocks, Count: %d ====================\n", g_block_index);
+        dump_content(formatbuffer, dumptofile);
+        for(i = 0; i < g_block_index; i++)
+        {
+            MemControlBlock * ctrl_block = &g_blocks_ptr[i];        
+            if(ctrl_block->addr_ptr != NULL) {
+
+                sprintf(formatbuffer, "%p:%d:%d\n", 
+                    ctrl_block->addr_ptr, ctrl_block->size, ctrl_block->bt_depth);
+                dump_content(formatbuffer, dumptofile);
+
+                for(j = 0; j < ctrl_block->bt_depth && j < MAX_DEPTH; j++)
+                {
+                    dump_backtrace((unsigned int)ctrl_block->backtrace[j], formatbuffer, sizeof(formatbuffer));
+                    dump_content(formatbuffer, dumptofile);
+                }
+                counter++;
+            }
+        }
+
+        sprintf(formatbuffer, "\n==================== Recorded Freed Blocks, Count: %d =====================\n", g_freed_index);
+        dump_content(formatbuffer, dumptofile);
+        for(i = 0; i < g_freed_index; i++)
+        {
+            sprintf(formatbuffer, "%p\n", (void *)g_free_ptrs[i]);
+            dump_content(formatbuffer, dumptofile);
+        }
+
+        if(dumptofile)
+        {
+            fflush(memtrace_file);
+            return snprintf(feedback, maxlen, ">> %d blocks of possible memory leak, details dumped to file %s", 
+                g_block_index - g_freed_index, dump_file_name);
+        }
+        else
+        {
+            return snprintf(feedback, maxlen, ">> %d blocks of possible memory leak detected, details dumped to logcat",
+                g_block_index - g_freed_index);
         }
     }
-
-    LOGI("Recorded Counter: %d, Looped Counter: %d\n", g_traced_count, counter);
-
-    if(dumptofile) {
-        fflush(memtrace_file);
-
-        return snprintf(feedback, maxlen, ">> %d blocks of memory leak detected, details dumped to file %s", g_traced_count, dump_file_name);
-    }
-
-    return snprintf(feedback, maxlen, ">> %d blocks of memory leak detected, details dumped to logcat.", g_traced_count);
 }
 
 void dump_content(char * content, int dumptofile)

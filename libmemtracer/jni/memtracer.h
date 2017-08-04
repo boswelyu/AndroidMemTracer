@@ -35,6 +35,8 @@ int stop_memtrace(char * feedback, int maxlen);
 
 int switch_simple_mode(char * feedback, int maxlen);
 
+int switch_qrecord_mode(char * feedback, int maxlen);
+
 int switch_backtrace_mode(char * feedback, int maxlen);
 
 int dump_leaked_memory(char * feedback, int maxlen);

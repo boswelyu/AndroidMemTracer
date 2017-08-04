@@ -72,7 +72,7 @@ int memtracer_entry(long * param)
 
 	LOGD("Start MemTracer Init with port: %d\n", g_socket_port);
 
-	if(memtracer_init(50000) != 0)
+	if(memtracer_init(300000) != 0)
 	{
 		LOGE("MemTracer Init Failed!");
 		return -1;
@@ -290,9 +290,13 @@ void * command_listener(void * params)
 				case 'r':
 					retlen = reset_memtracer(sendbuff, sizeof(sendbuff));
 					break;
+				case 'q':
+					retlen = switch_qrecord_mode(sendbuff, sizeof(sendbuff));
+					break;
 				default:
 					retlen = sprintf(sendbuff, "Invalid Command: %c, supported commands are:\n"
-						" s[start], e[end], d[dump], c[simple mode switch], b[backtrace switch], r[reset]\n", recvbuff[0]);
+						" s[start], e[end], d[dump], c[simple mode switch], q[qrecord mode switch], b[backtrace switch], r[reset]\n", 
+						recvbuff[0]);
 					break;
 			}
 
