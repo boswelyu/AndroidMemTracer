@@ -7,7 +7,7 @@
 #include <strings.h>
 
 // Forward declare of internal function
-void dump_content(char * content, int dumptofile);
+void dump_content(char * content, int dumptofile, int force);
 void add_map_element(unsigned int startaddr, unsigned int endaddr, char * libname);
 void record_valid_address(unsigned int startaddr, unsigned endaddr);
 void dump_backtrace(unsigned int addr, char * buffer, int maxlen);
@@ -615,7 +615,7 @@ int dump_leaked_memory(char * feedback, int maxlen)
     if(g_qrecord_mode == 0)
     {
         sprintf(formatbuffer, "==== %d blocks of memory leak detected ======\n", g_traced_count);
-        dump_content(formatbuffer, dumptofile);    
+        dump_content(formatbuffer, dumptofile, 0);    
         for(i = 0; i < g_block_count; i++) 
         {
             MemControlBlock * ctrlBlock = &g_blocks_ptr[i];        
@@ -623,17 +623,18 @@ int dump_leaked_memory(char * feedback, int maxlen)
 
                 sprintf(formatbuffer, "    Memory Leaked at:%p, leaked size:%d, bt depth: %d\n", 
                     ctrlBlock->addr_ptr, ctrlBlock->size, ctrlBlock->bt_depth);
-                dump_content(formatbuffer, dumptofile);
+                dump_content(formatbuffer, dumptofile, 0);
 
                 for(j = 0; j < ctrlBlock->bt_depth && j < MAX_DEPTH; j++)
                 {
                     dump_backtrace((unsigned int)ctrlBlock->backtrace[j], formatbuffer, sizeof(formatbuffer));
-                    dump_content(formatbuffer, dumptofile);
+                    dump_content(formatbuffer, dumptofile, 0);
                 }
                 counter++;
             }
         }
 
+        dump_content("Dump Done\n", dumptofile, 1);
         LOGI("Recorded Counter: %d, Looped Counter: %d\n", g_traced_count, counter);
 
         if(dumptofile) {
@@ -647,31 +648,31 @@ int dump_leaked_memory(char * feedback, int maxlen)
     else
     {
         sprintf(formatbuffer, "================== Recorded Malloc Blocks, Count: %d ====================\n", g_block_index);
-        dump_content(formatbuffer, dumptofile);
+        dump_content(formatbuffer, dumptofile, 0);
         for(i = 0; i < g_block_index; i++)
         {
             MemControlBlock * ctrl_block = &g_blocks_ptr[i];        
             if(ctrl_block->addr_ptr != NULL) {
 
-                sprintf(formatbuffer, "%p:%d:%d\n", 
-                    ctrl_block->addr_ptr, ctrl_block->size, ctrl_block->bt_depth);
-                dump_content(formatbuffer, dumptofile);
+                sprintf(formatbuffer, "%p:%d:%d:%d\n", 
+                    ctrl_block->addr_ptr, ctrl_block->size, ctrl_block->bt_depth, i);
+                dump_content(formatbuffer, dumptofile, 0);
 
                 for(j = 0; j < ctrl_block->bt_depth && j < MAX_DEPTH; j++)
                 {
                     dump_backtrace((unsigned int)ctrl_block->backtrace[j], formatbuffer, sizeof(formatbuffer));
-                    dump_content(formatbuffer, dumptofile);
+                    dump_content(formatbuffer, dumptofile, 0);
                 }
                 counter++;
             }
         }
 
         sprintf(formatbuffer, "\n==================== Recorded Freed Blocks, Count: %d =====================\n", g_freed_index);
-        dump_content(formatbuffer, dumptofile);
+        dump_content(formatbuffer, dumptofile, 0);
         for(i = 0; i < g_freed_index; i++)
         {
-            sprintf(formatbuffer, "%p\n", (void *)g_free_ptrs[i]);
-            dump_content(formatbuffer, dumptofile);
+            sprintf(formatbuffer, "%p %d\n", (void *)g_free_ptrs[i], i);
+            dump_content(formatbuffer, dumptofile, 0);
         }
 
         if(dumptofile)
@@ -682,19 +683,82 @@ int dump_leaked_memory(char * feedback, int maxlen)
         }
         else
         {
-            return snprintf(feedback, maxlen, ">> %d blocks of possible memory leak detected, details dumped to logcat",
-                g_block_index - g_freed_index);
+            dump_content("Dump Done\n", dumptofile, 1);
+            int len = snprintf(feedback, maxlen, ">> %d blocks of possible memory leak detected (%d - %d), details dumped to logcat\n",
+                g_block_index - g_freed_index, g_block_index, g_freed_index);
+            
+            if(g_qrecord_mode == 0) {
+                return len;
+            }
+            else
+            {
+                // In quick record mode, analysis the result, and dump the memory info to screen
+                MemControlBlock * temp_data = (MemControlBlock *)original_malloc(sizeof(MemControlBlock) * g_block_index);
+                memcpy(temp_data, g_blocks_ptr, sizeof(MemControlBlock) * g_block_index);
+                for(i = 0; i < g_freed_index; i++)
+                {
+                    void * freeaddr = (void *)g_free_ptrs[i];
+                    for(j = 0; j < g_block_index; j++)
+                    {
+                        if(temp_data[j].addr_ptr == freeaddr && temp_data[j].size > 0)
+                        {
+                            // 标记已经释放
+                            temp_data[j].size = 0;
+                            break;
+                        }
+                    }
+                }
+
+                for(i = 0; i < g_block_index; i++)
+                {
+                    if(temp_data[i].size > 0) {
+                        len += snprintf(feedback + len, maxlen - len, "\n%d not free at address: %p, size: %d\n", 
+                            i, temp_data[i].addr_ptr, temp_data[i].size);
+                        if(len >= maxlen - 10) {
+                            return len;
+                        }
+                    }
+                }
+                return len;
+            }
         }
     }
 }
 
-void dump_content(char * content, int dumptofile)
+char content_buffer[4096];
+char * content_ptr = content_buffer;
+
+
+void dump_content(char * content, int dumptofile, int force)
 {
     if(dumptofile == 1) {
         fputs(content, memtrace_file);
     }
     else {
-        LOGI("%s", content);
+
+        int newlen = strlen(content);
+        if((content_ptr - content_buffer) + newlen >= 4096)
+        {
+            LOGI("%s", content_buffer);
+
+            content_ptr = content_buffer;
+            memset(content_buffer, 0, 4096);
+            strcpy(content_buffer, content);
+            content_ptr += newlen;
+            return;
+        }
+        else
+        {
+            strcpy(content_ptr, content);
+            content_ptr += newlen;
+        }
+
+        if(force > 0)
+        {
+            LOGI("%s", content_buffer);
+            memset(content_buffer, 0, 4096);
+            content_ptr = content_buffer;
+        }
     }
 }
 

@@ -24,12 +24,16 @@ void post_process_str(char * strbuf, int maxlen);
 void * hook_worker(void * param);
 void * command_listener(void * param);
 
-int parse_target_library(const char *targetdir, const char *targetsoname);
+int parse_target_library(const char *targetsoname);
+
+int process_got_address(const char * path, const char * soname);
 
 int do_got_hook(void *symbol, void *new_function, void **old_function);
 
 
 char g_target_so[MAX_PATH_LEN];
+char * g_target_so_list[10];
+int g_target_so_count = 0;
 char g_main_dir[MAX_PATH_LEN];
 const int g_push_port = 7878;
 int g_socket_port = 7788;
@@ -100,38 +104,51 @@ void * hook_worker(void * param)
 	}
 
 	int iret;
-	iret = parse_target_library(g_main_dir, g_target_so);
+	iret = parse_target_library(g_target_so);
 	if(iret != 0)
 	{
-		LOGE("Parse Library File Failed!");
+		LOGE("Parse Library File Failed: %s", g_target_so);
 		return NULL;
 	}
 
-	iret = do_got_hook((void *)calloc, (void *)replaced_calloc, (void **)&orig_calloc);
-	if(iret != 0)
-	{
-		LOGE("MemTracer hook function calloc failed!");
-		return NULL;
-	}
+	interpret_mmaps();
 
-	iret = do_got_hook((void *)malloc, (void *)replaced_malloc, (void **)&orig_malloc);
-	if(iret != 0) {
-		LOGE("MemTracer hook function malloc failed!");
-		return NULL;
-	}
-
-	iret = do_got_hook((void *)realloc, (void *)replaced_realloc, (void **)&orig_realloc);
-	if(iret != 0)
+	int soidx;
+	for(soidx = 0; soidx < g_target_so_count; soidx++)
 	{
-		LOGE("MemTracer hook function realloc failed!");
-		return NULL;
-	}
+		iret = process_got_address(g_main_dir, g_target_so_list[soidx]);
+		if(iret != 0)
+		{
+			LOGE("MemTrace Get GOT Address for %s failed!", g_target_so_list[soidx]);
+			return NULL;
+		}
 
-	iret = do_got_hook((void *)free, (void *)replaced_free, (void **)&orig_free);
-	if(iret != 0)
-	{
-		LOGE("MemTracer hook function free failed!");
-		return NULL;
+		iret = do_got_hook((void *)calloc, (void *)replaced_calloc, (void **)&orig_calloc);
+		if(iret != 0)
+		{
+			LOGE("MemTracer hook function calloc failed!");
+			return NULL;
+		}
+
+		iret = do_got_hook((void *)malloc, (void *)replaced_malloc, (void **)&orig_malloc);
+		if(iret != 0) {
+			LOGE("MemTracer hook function malloc failed!");
+			return NULL;
+		}
+
+		iret = do_got_hook((void *)realloc, (void *)replaced_realloc, (void **)&orig_realloc);
+		if(iret != 0)
+		{
+			LOGE("MemTracer hook function realloc failed!");
+			return NULL;
+		}
+
+		iret = do_got_hook((void *)free, (void *)replaced_free, (void **)&orig_free);
+		if(iret != 0)
+		{
+			LOGE("MemTracer hook function free failed!");
+			return NULL;
+		}
 	}
 
 	// Hook finished, feedback injector
@@ -235,7 +252,7 @@ void * command_listener(void * params)
 {
 	LOGI("MemTracer Command Listener Thread Started!");
 
-	int sockfd = socket(PF_INET, SOCK_DGRAM, 0);
+	int sockfd = socket(PF_INET, SOCK_STREAM, 0);
 	if(sockfd < 0)
 	{
 		LOGE("ERROR: Create Local Socket Failed!");
@@ -254,16 +271,32 @@ void * command_listener(void * params)
 		return NULL;
 	}
 
+	if(listen(sockfd, 1) == -1) {
+		printf("Listen error: %s\n", strerror(errno));
+		return NULL;
+	}
+
+	struct sockaddr_in peeraddr;
+	socklen_t peerlen = sizeof(peeraddr);
+
+	int peersockfd = accept(sockfd, (struct sockaddr *)&peeraddr, &peerlen);
+	if(peersockfd < 0)
+	{
+		printf("Accept failed: %s\n", strerror(errno));
+		return NULL;
+	}
+
+	// Accepted one peer
 	char recvbuff[128];
 	char sendbuff[1024];
-	struct sockaddr_in peeraddr;
-	socklen_t peerlen;
+	
+	
 	int n;
 
 	while(1)
 	{
 		memset(recvbuff, 0, sizeof(recvbuff));
-		n = recvfrom(sockfd, recvbuff, sizeof(recvbuff), 0, (struct sockaddr *)&peeraddr, &peerlen);
+		n = recv(peersockfd, recvbuff, sizeof(recvbuff), 0);
 
 		if(n > 0) {
 			recvbuff[n] = 0;
@@ -300,7 +333,7 @@ void * command_listener(void * params)
 					break;
 			}
 
-			sendto(sockfd, sendbuff, retlen, 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+			send(peersockfd, sendbuff, retlen, 0);
 		}
 	}
 
@@ -499,7 +532,33 @@ int GetGotStartAddrAndSize(FILE *fp, uint32_t *GotTableStartaddr, uint32_t *GotT
 }
 
 //解析要寻找GOT位置的so文件
-int parse_target_library(const char *TargetDir, const char *TargetSoName)
+int parse_target_library(const char *TargetSoName)
+{
+	if(NULL == TargetSoName)
+	{
+		LOGE("[-] TargetSoName is NUll.");
+		return -1;
+	}
+
+	char * resstr = strtok((char *)TargetSoName, ",");
+	while(resstr != NULL)
+	{
+		g_target_so_list[g_target_so_count] = (char *)malloc(strlen(resstr) + 1);
+		strcpy(g_target_so_list[g_target_so_count], resstr);
+		g_target_so_count++;
+
+		if(g_target_so_count >= 10) {
+			LOGE("Too Many Target So: %s\n", TargetSoName);
+			break;
+		}
+
+		resstr = strtok(NULL, ",");
+	}
+
+	return 0;
+}
+
+int process_got_address(const char * TargetDir, const char * targetso)
 {
 	if(NULL == TargetDir)
 	{
@@ -507,14 +566,8 @@ int parse_target_library(const char *TargetDir, const char *TargetSoName)
 		return -1;
 	}
 
-	if(NULL == TargetSoName)
-	{
-		LOGE("[-] TargetSoName is NUll.");
-		return -1;
-	}
-
 	char filepath[256] = {0};
-	snprintf(filepath, sizeof(filepath), "%s/%s", TargetDir, TargetSoName);
+	snprintf(filepath, sizeof(filepath), "%s/%s", TargetDir, targetso);
 
 	FILE * file = fopen(filepath, "rb");
 	if(NULL == file)
@@ -531,8 +584,7 @@ int parse_target_library(const char *TargetDir, const char *TargetSoName)
 	LOGI("[+] uiGotTableStartaddr is %08x\n",g_GotTableStartaddr);
 	LOGI("[+] uiGotTableSize is %08x\n",g_GotTableSize);
 
-	g_base = get_module_base(-1, TargetSoName);
-	interpret_mmaps();
+	g_base = get_module_base(-1, targetso);
 
 	fclose(file);
 	return 0;

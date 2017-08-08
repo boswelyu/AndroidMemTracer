@@ -242,7 +242,7 @@ void * push_worker(void * param)
 int start_commander()
 {
 	int sock;
-    if ((sock = socket(PF_INET, SOCK_DGRAM, 0)) < 0)
+    if ((sock = socket(PF_INET, SOCK_STREAM, 0)) < 0)
     {
     	printf("Create commander socket failed.\n");
     	return -1;
@@ -256,6 +256,12 @@ int start_commander()
     servaddr.sin_port = htons(socket_port);
     servaddr.sin_addr.s_addr = inet_addr(SERVERIP);
 
+    if(connect(sock, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+    {
+    	LOGE("Connect to command listener server failed: %s", strerror(errno));
+    	return -1;
+    }
+
     // Start a thread to listening the command feedback
     pthread_t recvthread;
 	pthread_create(&recvthread, NULL, feedback_listener, &sock);
@@ -267,7 +273,7 @@ int start_commander()
     char sendbuf[256] = {0};
     while (fgets(sendbuf, sizeof(sendbuf), stdin) != NULL)
     {
-        sendto(sock, sendbuf, strlen(sendbuf), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
+        send(sock, sendbuf, strlen(sendbuf), 0);
         //ret = recvfrom(sock, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
         //if (ret == -1)
         //{
@@ -291,7 +297,7 @@ void * feedback_listener(void * param)
 	while(1)
 	{
 		memset(recvbuff, 0, sizeof(recvbuff));
-		ret = recvfrom(servsock, recvbuff, sizeof(recvbuff), 0, NULL, NULL);
+		ret = recv(servsock, recvbuff, sizeof(recvbuff), 0);
 		if(ret >= 0) {
 			printf("%s\n", recvbuff);
 		}
